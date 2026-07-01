@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="swtpm-dtc/swtpm-dtc.vcxproj" Id="2d0b5bf5-883c-4aa4-8a72-87498d90b987" />
+</Solution>
