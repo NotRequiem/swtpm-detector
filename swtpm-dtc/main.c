@@ -1,4 +1,5 @@
 #include "tpm_verify.h"
+#include "tpm_passthrough.h"
 
 BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
     HCERTSTORE hCabRoots,
@@ -23,7 +24,7 @@ BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
 
     if (cert_is_self_signed(leaf)) {
         if (cert_is_trusted_root(leaf, hCabRoots)) {
-            fprintf(out, "%*sSelf-signed root found in the Microsoft TrustedTpm package.\n", (int)(depth * 2), "");
+            fprintf(out, "%*sSelf-signed root found in the trusted root store.\n", (int)(depth * 2), "");
             if (outPath) *outPath = TRUST_PATH_TPM_CAB;
             return TRUE;
         }
@@ -46,6 +47,17 @@ BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
                 if (downloaded) {
                     if (CertAddCertificateContextToStore(hCandidateStore, downloaded, CERT_STORE_ADD_ALWAYS, NULL)) {
                         fprintf(out, "%*sLoaded AIA issuer candidate into memory.\n", (int)(depth * 2), "");
+
+                        if (cert_is_self_signed(downloaded)) {
+                            if (is_trusted_manufacturer_url(urls.items[i])) {
+                                if (CertAddCertificateContextToStore(hCabRoots, downloaded, CERT_STORE_ADD_ALWAYS, NULL)) {
+                                    fprintf(out, "%*s[+] Dynamic trust verified: Added downloaded manufacturer root to trusted store.\n", (int)(depth * 2) + 2, "");
+                                }
+                            }
+                            else {
+                                fprintf(out, "%*s[!] Untrusted Root Source: Self-signed certificate downloaded from unpinned domain (%ws).\n", (int)(depth * 2) + 2, "", urls.items[i]);
+                            }
+                        }
                     }
                     CertFreeCertificateContext(downloaded);
                 }
@@ -100,11 +112,6 @@ BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert,
 
     printf("  EK public key matches the EK certificate public key.\n");
 
-    /*
-    if (!perform_local_tpm_pop_challenge(ekCert)) {
-        printf("  [CRITICAL] TPM failed the cryptographic proof-of-possession challenge.\n");
-        return FALSE;
-    }*/
     if (!manual_ek_chain_walk(ekCert, hCabRoots, hCandidateStore, 0, outPath, NULL, stdout)) {
         return FALSE;
     }
@@ -115,7 +122,6 @@ BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert,
 static void print_tpm_banner(const TPMINFO* info) {
     printf("TPM version from TBS: %s\n", info->isTpm2 ? "2.0" : "1.2");
     print_ascii4("TPM manufacturer ID", info->manufacturerId);
-    // printf("TPM family indicator: %s\n", info->familyIndicatorText[0] ? info->familyIndicatorText : "(unknown)");
     printf("TPM vendor string: %s\n", info->vendorString[0] ? info->vendorString : "(unknown)");
     printf("TPM firmware version: 0x%016llx\n", (unsigned long long)info->firmwareVersion);
     print_utf8_or_unknown("PCP platform type", info->providerType);
@@ -217,7 +223,7 @@ int wmain(int argc, wchar_t* argv[]) {
         goto cleanup;
     }
 
-    printf("CAB roots: %lu\n", (unsigned long)rootCount);
+    printf("Total Trusted Roots (CAB Strictly): %lu\n", (unsigned long)rootCount);
     printf("CAB intermediates: %lu\n", (unsigned long)intermediateCount);
 
     printf("Loading EK certificate store from the TPM provider...\n");
@@ -294,7 +300,15 @@ int wmain(int argc, wchar_t* argv[]) {
     else {
         printf("\n\nResult: TPM is legit.\n");
     }
-    ok = TRUE;
+
+    printf("\n[*] Starting passthrough checks...\n");
+    if (!detect_tpm_passthrough()) {
+        printf("\n\nResult: Passed-through virtualized hardware detected.\n");
+        ok = FALSE; 
+    }
+    else {
+        printf("\n\nResult: Real hardware TPM verified.\n");
+    }
 
 cleanup:
     if (ekLeaf) CertFreeCertificateContext(ekLeaf);

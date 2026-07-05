@@ -659,8 +659,7 @@ fail:
     return FALSE;
 }
 
-// Manual AES-CFB-128 Encryption Loop to allow raw 18-byte input encryption
-static BOOL AES_CFB128_Encrypt(const BYTE* key, DWORD keySize, const BYTE* plaintext, DWORD plaintextLen, BYTE* ciphertext) {
+static BOOL aes_cfb128_encrypt(const BYTE* key, DWORD keySize, const BYTE* plaintext, DWORD plaintextLen, BYTE* ciphertext) {
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
     PBYTE pbKeyObject = NULL;
@@ -744,7 +743,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
         hRng = NULL;
     }
     else {
-        printf("  [WARN] BCrypt RNG provider unavailable; will fall back to rand().\n");
+        printf("  [!] BCrypt RNG provider unavailable; will fall back to rand().\n");
     }
 
     s = NCryptOpenStorageProvider(&hProv, MS_PLATFORM_CRYPTO_PROVIDER, 0);
@@ -818,7 +817,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
         }
 
         if (cbName < 3) {
-            printf("  [FAILURE] AIK Name blob is too small.\n");
+            printf("  [-] AIK Name blob is too small.\n");
             free(pbIdBinding);
             free(rsaKeyBlob);
             free(name);
@@ -833,7 +832,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
         printf("  Credential / POP nonce size: %lu bytes\n", (unsigned long)challengeLen);
 
         if (challengeLen != 32) {
-            printf("  [WARN] This TPM Name digest size is not 32 bytes. The attestation profile usually expects the nonce to match the Name hash size.\n");
+            printf("  [!] This TPM Name digest size is not 32 bytes. The attestation profile usually expects the nonce to match the Name hash size.\n");
         }
     }
 
@@ -843,7 +842,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
     nonce = (BYTE*)malloc(challengeLen);
     encNonce = (BYTE*)malloc(challengeLen);
     if (!nonce || !encNonce) {
-        printf("  [ERROR] Out of memory allocating challenge buffers.\n");
+        printf("  [-] Out of memory allocating challenge buffers.\n");
         free(nonce);
         free(encNonce);
         free(rsaKeyBlob);
@@ -857,13 +856,13 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
         BCRYPT_ALG_HANDLE hSeedRng = NULL;
         if (BCryptOpenAlgorithmProvider(&hSeedRng, BCRYPT_RNG_ALGORITHM, NULL, 0) == STATUS_SUCCESS) {
             if (BCryptGenRandom(hSeedRng, nonce, challengeLen, 0) != STATUS_SUCCESS) {
-                printf("  [WARN] BCryptGenRandom failed; falling back to rand().\n");
+                printf("  [!] BCryptGenRandom failed; falling back to rand().\n");
                 for (DWORD i = 0; i < challengeLen; ++i) nonce[i] = (BYTE)(rand() & 0xFF);
             }
             BCryptCloseAlgorithmProvider(hSeedRng, 0);
         }
         else {
-            printf("  [WARN] RNG provider unavailable for challenge; falling back to rand().\n");
+            printf("  [!] RNG provider unavailable for challenge; falling back to rand().\n");
             for (DWORD i = 0; i < challengeLen; ++i) nonce[i] = (BYTE)(rand() & 0xFF);
         }
     }
@@ -875,26 +874,26 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
 
         status = BCryptOpenAlgorithmProvider(&hRsaAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
         if (status != STATUS_SUCCESS) {
-            printf("  [ERROR] BCryptOpenAlgorithmProvider(RSA) failed: 0x%08X\n", status);
+            printf("  [-] BCryptOpenAlgorithmProvider(RSA) failed: 0x%08X\n", status);
             goto cleanup;
         }
 
         status = BCryptImportKeyPair(hRsaAlg, NULL, BCRYPT_RSAPUBLIC_BLOB, &hRsaKey, rsaKeyBlob, rsaKeyBlobSize, 0);
         if (status != STATUS_SUCCESS) {
-            printf("  [ERROR] BCryptImportKeyPair failed: 0x%08X\n", status);
+            printf("  [-] BCryptImportKeyPair failed: 0x%08X\n", status);
             goto cleanup_rsa;
         }
 
         DWORD seedSize = 32;
         BYTE* seed = (BYTE*)malloc(seedSize);
         if (!seed) {
-            printf("  [ERROR] Out of memory allocating seed.\n");
+            printf("  [-] Out of memory allocating seed.\n");
             goto cleanup_rsa;
         }
 
         if (BCryptOpenAlgorithmProvider(&hRng, BCRYPT_RNG_ALGORITHM, NULL, 0) == STATUS_SUCCESS) {
             if (BCryptGenRandom(hRng, seed, seedSize, 0) != STATUS_SUCCESS) {
-                printf("  [WARN] BCryptGenRandom(seed) failed; using rand().\n");
+                printf("  [!] BCryptGenRandom(seed) failed; using rand().\n");
                 for (size_t i = 0; i < seedSize; ++i) seed[i] = (BYTE)(rand() & 0xFF);
             }
             BCryptCloseAlgorithmProvider(hRng, 0);
@@ -913,14 +912,14 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
         DWORD encSecretAlloc = 0;
         status = BCryptEncrypt(hRsaKey, seed, seedSize, &oaepInfo, NULL, 0, NULL, 0, &encSecretAlloc, BCRYPT_PAD_OAEP);
         if (status != STATUS_SUCCESS || encSecretAlloc == 0) {
-            printf("  [ERROR] BCryptEncrypt(RSA size query) failed: 0x%08X\n", status);
+            printf("  [-] BCryptEncrypt(RSA size query) failed: 0x%08X\n", status);
             free(seed);
             goto cleanup_rsa;
         }
 
         BYTE* rawEnc = (BYTE*)malloc(encSecretAlloc);
         if (!rawEnc) {
-            printf("  [ERROR] Out of memory allocating wrapped seed buffer.\n");
+            printf("  [-] Out of memory allocating wrapped seed buffer.\n");
             free(seed);
             goto cleanup_rsa;
         }
@@ -928,7 +927,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
         DWORD encOut = 0;
         status = BCryptEncrypt(hRsaKey, seed, seedSize, &oaepInfo, NULL, 0, rawEnc, encSecretAlloc, &encOut, BCRYPT_PAD_OAEP);
         if (status != STATUS_SUCCESS) {
-            printf("  [ERROR] BCryptEncrypt(RSA seed encryption) failed: 0x%08X\n", status);
+            printf("  [-] BCryptEncrypt(RSA seed encryption) failed: 0x%08X\n", status);
             free(rawEnc);
             free(seed);
             goto cleanup_rsa;
@@ -937,7 +936,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
         encSecretSize = 2 + encOut;
         encSecretBytes = (BYTE*)malloc(encSecretSize);
         if (!encSecretBytes) {
-            printf("  [ERROR] Out of memory allocating EK-wrapped seed.\n");
+            printf("  [-] Out of memory allocating EK-wrapped seed.\n");
             free(rawEnc);
             free(seed);
             goto cleanup_rsa;
@@ -955,13 +954,13 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
             BYTE hmacKey[32];
 
             if (!KDFa_Generic(0x000B, seed, seedSize, "STORAGE", name, cbName, 128, symKey)) {
-                printf("  [ERROR] KDFa(STORAGE) failed.\n");
+                printf("  [-] KDFa(STORAGE) failed.\n");
                 free(seed);
                 goto cleanup_rsa;
             }
 
             if (!KDFa_Generic(0x000B, seed, seedSize, "INTEGRITY", NULL, 0, 256, hmacKey)) {
-                printf("  [ERROR] KDFa(INTEGRITY) failed.\n");
+                printf("  [-] KDFa(INTEGRITY) failed.\n");
                 free(seed);
                 goto cleanup_rsa;
             }
@@ -969,8 +968,8 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
             dump_hex_prefix("  Derived STORAGE key", symKey, sizeof(symKey), 32);
             dump_hex_prefix("  Derived INTEGRITY key", hmacKey, sizeof(hmacKey), 32);
 
-            if (!AES_CFB128_Encrypt(symKey, sizeof(symKey), nonce, challengeLen, encNonce)) {
-                printf("  [ERROR] AES_CFB128_Encrypt failed.\n");
+            if (!aes_cfb128_encrypt(symKey, sizeof(symKey), nonce, challengeLen, encNonce)) {
+                printf("  [-] AES_CFB128_Encrypt failed.\n");
                 free(seed);
                 goto cleanup_rsa;
             }
@@ -985,14 +984,14 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
 
                 status = BCryptOpenAlgorithmProvider(&hHmacAlg, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
                 if (status != STATUS_SUCCESS) {
-                    printf("  [ERROR] BCryptOpenAlgorithmProvider(HMAC) failed: 0x%08X\n", status);
+                    printf("  [-] BCryptOpenAlgorithmProvider(HMAC) failed: 0x%08X\n", status);
                     free(seed);
                     goto cleanup_rsa;
                 }
 
                 status = BCryptGetProperty(hHmacAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbHashObject, sizeof(cbHashObject), &cbRes, 0);
                 if (status != STATUS_SUCCESS || cbHashObject == 0) {
-                    printf("  [ERROR] BCryptGetProperty(HMAC Object length) failed: 0x%08X\n", status);
+                    printf("  [-] BCryptGetProperty(HMAC Object length) failed: 0x%08X\n", status);
                     BCryptCloseAlgorithmProvider(hHmacAlg, 0);
                     free(seed);
                     goto cleanup_rsa;
@@ -1000,7 +999,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
 
                 PBYTE pbHashObject = (PBYTE)malloc(cbHashObject);
                 if (!pbHashObject) {
-                    printf("  [ERROR] Out of memory allocating HMAC hash object.\n");
+                    printf("  [-] Out of memory allocating HMAC hash object.\n");
                     BCryptCloseAlgorithmProvider(hHmacAlg, 0);
                     free(seed);
                     goto cleanup_rsa;
@@ -1008,7 +1007,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
 
                 status = BCryptCreateHash(hHmacAlg, &hHmac, pbHashObject, cbHashObject, hmacKey, sizeof(hmacKey), 0);
                 if (status != STATUS_SUCCESS) {
-                    printf("  [ERROR] BCryptCreateHash failed: 0x%08X\n", status);
+                    printf("  [-] BCryptCreateHash failed: 0x%08X\n", status);
                     free(pbHashObject);
                     BCryptCloseAlgorithmProvider(hHmacAlg, 0);
                     free(seed);
@@ -1018,7 +1017,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
                 if (BCryptHashData(hHmac, encNonce, challengeLen, 0) != STATUS_SUCCESS ||
                     BCryptHashData(hHmac, name, cbName, 0) != STATUS_SUCCESS ||
                     BCryptFinishHash(hHmac, hmacOut, sizeof(hmacOut), 0) != STATUS_SUCCESS) {
-                    printf("  [ERROR] HMAC computation failed.\n");
+                    printf("  [-] HMAC computation failed.\n");
                     BCryptDestroyHash(hHmac);
                     free(pbHashObject);
                     BCryptCloseAlgorithmProvider(hHmacAlg, 0);
@@ -1031,7 +1030,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
                 BCryptCloseAlgorithmProvider(hHmacAlg, 0);
 
                 if (!build_tpm2b_id_object(hmacOut, sizeof(hmacOut), encNonce, challengeLen, &idObjectBytes, &idObjectSize)) {
-                    printf("  [ERROR] build_tpm2b_id_object failed.\n");
+                    printf("  [-] build_tpm2b_id_object failed.\n");
                     free(seed);
                     goto cleanup_rsa;
                 }
@@ -1041,7 +1040,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
                 activationBlobSize = idObjectSize + encSecretSize;
                 activationBlob = (BYTE*)malloc(activationBlobSize);
                 if (!activationBlob) {
-                    printf("  [ERROR] Out of memory allocating activation blob.\n");
+                    printf("  [-] Out of memory allocating activation blob.\n");
                     free(seed);
                     goto cleanup_rsa;
                 }
@@ -1057,9 +1056,8 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
                     activationBlobSize,
                     0);
                 if (s != ERROR_SUCCESS) {
-                    print_ntstatus("  [FAILURE] NCryptSetProperty(PCP_TPM12_IDACTIVATION)", s);
+                    print_ntstatus("  [-] NCryptSetProperty(PCP_TPM12_IDACTIVATION)", s);
                     printf("  [DEBUG] The provider rejected the blob before any returned credential existed.\n");
-                    printf("  [DEBUG] This is not a cryptographic mismatch; it is a provider/path rejection.\n");
                     goto cleanup_rsa;
                 }
 
@@ -1076,19 +1074,18 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
                         s, (unsigned long)cbUnwrapped);
 
                     if (s == TPM_20_E_VALUE || s == 0x80280084) {
-                        printf("  [DEBUG] TPM_20_E_VALUE at the size-query step usually means the activation blob or property path is not accepted by this PCP/TPM combination.\n");
-                        printf("  [DEBUG] On this platform, that strongly suggests the current PCP_TPM12_IDACTIVATION route is unsupported for TPM 2.0 activation.\n");
+                        printf("  [DEBUG] PCP_TPM12_IDACTIVATION route is unsupported for TPM 2.0 activation.\n");
                         goto cleanup_rsa;
                     }
 
                     if (s != NTE_BUFFER_TOO_SMALL && s != ERROR_SUCCESS) {
-                        print_ntstatus("  [FAILURE] NCryptGetProperty(PCP_TPM12_IDACTIVATION) - Size query failed", s);
+                        print_ntstatus("  [-] NCryptGetProperty(PCP_TPM12_IDACTIVATION) - Size query failed", s);
                         goto cleanup_rsa;
                     }
 
                     BYTE* unwrapped = (BYTE*)malloc(cbUnwrapped ? cbUnwrapped : 1);
                     if (!unwrapped) {
-                        printf("  [ERROR] Out of memory allocating returned credential buffer.\n");
+                        printf("  [-] Out of memory allocating returned credential buffer.\n");
                         goto cleanup_rsa;
                     }
 
@@ -1107,12 +1104,12 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
                             ok = TRUE;
                         }
                         else {
-                            printf("  [FAILURE] Decrypted credential mismatch. Expected %lu bytes.\n",
+                            printf("  [-] Decrypted credential mismatch. Expected %lu bytes.\n",
                                 (unsigned long)challengeLen);
                         }
                     }
                     else {
-                        print_ntstatus("  [FAILURE] NCryptGetProperty(PCP_TPM12_IDACTIVATION) - Decryption denied", s);
+                        print_ntstatus("  [-] NCryptGetProperty(PCP_TPM12_IDACTIVATION) - Decryption denied", s);
                         printf("  [DEBUG] Provider accepted SetProperty but refused to return any credential.\n");
                     }
 

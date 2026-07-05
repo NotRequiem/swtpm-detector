@@ -30,9 +30,15 @@
     <ClCompile Include="tpm_info.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tpm_passthrough.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tpm_verify.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tpm_passthrough.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

@@ -628,3 +628,44 @@ Fail:
     BCryptCloseAlgorithmProvider(hAlg, 0);
     return FALSE;
 }
+
+BOOL is_trusted_manufacturer_url(const WCHAR* url) {
+    if (!url) return FALSE;
+
+    size_t len = wcslen(url);
+    WCHAR* lower = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
+    if (!lower) return FALSE;
+    for (size_t i = 0; i <= len; i++) {
+        lower[i] = (WCHAR)towlower(url[i]);
+    }
+
+    BOOL trusted = FALSE;
+    const WCHAR* trusted_domains[] = {
+        L"ftpm.amd.com",
+        L"download.amd.com",
+        L"intel.com",
+        L"trustedservices.intel.com",
+        L"ekop.intel.com",
+        L"tpmsec.microsoft.com",
+        L"microsoftaik.azure.net",
+        L"spserv.microsoft.com",
+        L"nuvoton.com",
+        L"infineon.com",
+        L"st.com",
+        L"globalsign.com",
+        L"globalsign.net",
+        L"qualcomm.com",
+        L"qcom.com",
+        L"nxp.com"
+    };
+
+    for (size_t i = 0; i < sizeof(trusted_domains) / sizeof(trusted_domains[0]); i++) {
+        if (wcsstr(lower, trusted_domains[i]) != NULL) {
+            trusted = TRUE;
+            break;
+        }
+    }
+
+    free(lower);
+    return trusted;
+}

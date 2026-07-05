@@ -175,4 +175,6 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert);
 BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf, HCERTSTORE hCabRoots, HCERTSTORE hCandidateStore, DWORD depth, TRUST_PATH* outPath, PCCERT_CONTEXT* outLeaf, FILE* out);
 BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert, const BYTE* ekPub, DWORD ekPubSize, HCERTSTORE hCabRoots, HCERTSTORE hCandidateStore, TRUST_PATH* outPath, PCCERT_CONTEXT* outLeaf);
 
+BOOL is_trusted_manufacturer_url(const WCHAR* url);
+
 #endif

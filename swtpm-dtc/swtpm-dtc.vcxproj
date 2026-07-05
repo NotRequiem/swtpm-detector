@@ -156,8 +156,10 @@
     <ClCompile Include="downloader.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="tpm_info.c" />
+    <ClCompile Include="tpm_passthrough.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="tpm_passthrough.h" />
     <ClInclude Include="tpm_verify.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
