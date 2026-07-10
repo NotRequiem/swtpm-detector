@@ -1,32 +1,25 @@
 #include "tpm_passthrough.h"
 
 #include <bcrypt.h>
-#include <ncrypt.h>
 #include <tbs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef _MSC_VER
     #pragma comment(lib, "tbs.lib")
     #pragma comment(lib, "bcrypt.lib")
-    #pragma comment(lib, "ncrypt.lib")
 #endif
 
-#ifndef TBS_TCGLOG_SRTM_CURRENT
-    #define TBS_TCGLOG_SRTM_CURRENT 1
+#ifdef TBS_TCGLOG_SRTM_CURRENT
+    #undef TBS_TCGLOG_SRTM_CURRENT
 #endif
 
-#ifndef NCRYPT_CLAIM_PLATFORM
-    #define NCRYPT_CLAIM_PLATFORM 0x00010000
-#endif
+#define TBS_TCGLOG_SRTM_CURRENT 0
 
-#ifndef NCRYPTBUFFER_TPM_PLATFORM_CLAIM_PCR_MASK
-    #define NCRYPTBUFFER_TPM_PLATFORM_CLAIM_PCR_MASK 82
-#endif
-
-#ifndef NCRYPTBUFFER_TPM_PLATFORM_CLAIM_NONCE
-    #define NCRYPTBUFFER_TPM_PLATFORM_CLAIM_NONCE 81
+#ifndef TBS_TCGLOG_DRTM_CURRENT
+    #define TBS_TCGLOG_DRTM_CURRENT 1
 #endif
 
 #ifndef TPM_ALG_SHA256
@@ -52,7 +45,7 @@ typedef struct {
 
 typedef struct {
     uint32_t eventType;
-    uint8_t digest[32]; 
+    uint8_t digest[32];
     uint32_t digestSize;
 } TrackedEvent;
 
@@ -197,14 +190,14 @@ static BOOL read_tpm_pcr(TBS_HCONTEXT hContext, uint32_t pcrIndex, uint16_t algI
     if (code != 0) return FALSE;
 
     uint32_t offset = 10;
-    offset += 4; 
+    offset += 4;
 
     if (offset + 4 > respSize) return FALSE;
     uint32_t selCount = ((uint32_t)resp[offset] << 24) | ((uint32_t)resp[offset + 1] << 16) | ((uint32_t)resp[offset + 2] << 8) | resp[offset + 3];
     offset += 4;
     if (selCount != 1) return FALSE;
 
-    offset += 2; 
+    offset += 2;
     if (offset + 1 > respSize) return FALSE;
     uint8_t retSizeofSelect = resp[offset];
     offset += 1 + retSizeofSelect;
@@ -268,27 +261,6 @@ static void trace_pcr_reconstruction(const PcrEventList* list, const uint8_t* ac
     printf("\n");
 }
 
-static NCRYPT_KEY_HANDLE get_or_create_aik(NCRYPT_PROV_HANDLE hProv) {
-    NCRYPT_KEY_HANDLE hKey = 0;
-    SECURITY_STATUS status = NCryptOpenKey(hProv, &hKey, L"VMOwnedAttestationKey", 0, 0);
-    if (status == ERROR_SUCCESS) {
-        return hKey;
-    }
-
-    status = NCryptCreatePersistedKey(hProv, &hKey, BCRYPT_RSA_ALGORITHM, L"VMOwnedAttestationKey", 0, 0);
-    if (status != ERROR_SUCCESS) {
-        return 0;
-    }
-
-    status = NCryptFinalizeKey(hKey, 0);
-    if (status != ERROR_SUCCESS) {
-        NCryptFreeObject(hKey);
-        return 0;
-    }
-
-    return hKey;
-}
-
 BOOL detect_tpm_passthrough(void) {
     TBS_CONTEXT_PARAMS2 params = { 0 };
     params.version = TBS_CONTEXT_VERSION_TWO;
@@ -299,14 +271,14 @@ BOOL detect_tpm_passthrough(void) {
     TBS_HCONTEXT hTbsContext = 0;
     TBS_RESULT hr = Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &hTbsContext);
     if (hr != TBS_SUCCESS) {
-        fprintf(stderr, "[-] Failed to establish TBS context. Code: 0x%08lX\n", (unsigned long)hr);
+        printf("[-] Failed to establish TBS context. Code: 0x%08lX\n", (unsigned long)hr);
         return FALSE;
     }
 
     UINT32 logSize = 0;
     hr = Tbsi_Get_TCG_Log_Ex(TBS_TCGLOG_SRTM_CURRENT, NULL, &logSize);
     if (hr != TBS_E_INSUFFICIENT_BUFFER && hr != TBS_SUCCESS) {
-        fprintf(stderr, "[-] Failed to retrieve log size. Code: 0x%08lX\n", (unsigned long)hr);
+        printf("[-] Failed to retrieve log size. Code: 0x%08lX\n", (unsigned long)hr);
         Tbsip_Context_Close(hTbsContext);
         return FALSE;
     }
@@ -319,16 +291,16 @@ BOOL detect_tpm_passthrough(void) {
 
     hr = Tbsi_Get_TCG_Log_Ex(TBS_TCGLOG_SRTM_CURRENT, logBuffer, &logSize);
     if (hr != TBS_SUCCESS) {
-        fprintf(stderr, "[-] Failed to download TCG log. Code: 0x%08lX\n", (unsigned long)hr);
+        printf("[-] Failed to download TCG log. Code: 0x%08lX\n", (unsigned long)hr);
         free(logBuffer);
         Tbsip_Context_Close(hTbsContext);
         return FALSE;
     }
-    printf("[+] Downloaded TCG Log (" "%lu" " bytes).\n", (unsigned long)logSize);
+    printf("[+] Downloaded TCG Log (%lu bytes).\n", (unsigned long)logSize);
 
     AlgSizeMap algToSize;
     algsizemap_init(&algToSize);
-    algsizemap_set(&algToSize, 0x0004, 20); 
+    algsizemap_set(&algToSize, 0x0004, 20);
     algsizemap_set(&algToSize, TPM_ALG_SHA256, 32);
 
     PcrEventList pcrEvents[24] = { 0 };
@@ -346,10 +318,10 @@ BOOL detect_tpm_passthrough(void) {
             const uint8_t* firstEventData = logBuffer + offset;
             offset += firstHeader->EventSize;
 
-            if (firstHeader->EventType == 0x03 && firstHeader->EventSize >= 28) { 
+            if (firstHeader->EventType == 0x03 && firstHeader->EventSize >= 24) {
                 if (memcmp(firstEventData, "Spec ID Event03", 15) == 0) {
-                    uint32_t numAlgs = *(const uint32_t*)(firstEventData + 24);
-                    uint32_t algOffset = 28;
+                    uint8_t numAlgs = *(const uint8_t*)(firstEventData + 23);
+                    uint32_t algOffset = 24;
                     for (uint32_t i = 0; i < numAlgs; ++i) {
                         if (algOffset + 4 > firstHeader->EventSize) break;
                         uint16_t algId = *(const uint16_t*)(firstEventData + algOffset);
@@ -408,7 +380,7 @@ BOOL detect_tpm_passthrough(void) {
         offset += 4;
 
         if (offset + eventSize > logSize) break;
-        offset += eventSize; 
+        offset += eventSize;
 
         for (uint32_t i = 0; i < tempDigestCount; ++i) {
             if (tempDigests[i].algId == TPM_ALG_SHA256 && pcrIndex < 24) {
@@ -425,7 +397,7 @@ BOOL detect_tpm_passthrough(void) {
         for (uint32_t j = 0; j < pcrEvents[pcrIdx].count; ++j) {
             const TrackedEvent* ev = &pcrEvents[pcrIdx].items[j];
             if (ev->eventType == 0x00000003) {
-                continue; 
+                continue;
             }
             uint8_t concat[64];
             memcpy(concat, currentPCR, 32);
@@ -463,7 +435,7 @@ BOOL detect_tpm_passthrough(void) {
             }
         }
         else {
-            fprintf(stderr, "[-] Failed to read actual PCR[%u]\n", pcrIdx);
+            printf("[-] Failed to read actual PCR[%u]\n", pcrIdx);
         }
     }
 
@@ -478,66 +450,11 @@ BOOL detect_tpm_passthrough(void) {
         }
     }
 
-    printf("[*] Quoting TPM...\n");
-    NCRYPT_PROV_HANDLE hProv = 0;
-    SECURITY_STATUS status = NCryptOpenStorageProvider(&hProv, MS_PLATFORM_CRYPTO_PROVIDER, 0);
-    if (status == ERROR_SUCCESS) {
-        NCRYPT_KEY_HANDLE hAik = get_or_create_aik(hProv);
-        if (hAik != 0) {
-            uint8_t pcrMask[] = { 0xFF, 0x00, 0x00 }; 
-            uint8_t nonce[20] = { 0 };
-            NTSTATUS ntStatus = BCryptGenRandom(NULL, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-            (ntStatus);
-
-            NCryptBuffer paramBuffers[2] = { 0 };
-            paramBuffers[0].BufferType = NCRYPTBUFFER_TPM_PLATFORM_CLAIM_PCR_MASK;
-            paramBuffers[0].cbBuffer = sizeof(pcrMask);
-            paramBuffers[0].pvBuffer = pcrMask;
-
-            paramBuffers[1].BufferType = NCRYPTBUFFER_TPM_PLATFORM_CLAIM_NONCE;
-            paramBuffers[1].cbBuffer = sizeof(nonce);
-            paramBuffers[1].pvBuffer = nonce;
-
-            NCryptBufferDesc paramList = { 0 };
-            paramList.ulVersion = NCRYPTBUFFER_VERSION;
-            paramList.cBuffers = 2;
-            paramList.pBuffers = paramBuffers;
-
-            DWORD cbClaim = 0;
-            status = NCryptCreateClaim(0, hAik, NCRYPT_CLAIM_PLATFORM, &paramList, NULL, 0, &cbClaim, 0);
-            if (status == ERROR_SUCCESS || status == NTE_BUFFER_TOO_SMALL) {
-                BYTE* claimBlob = (BYTE*)malloc(cbClaim);
-                if (claimBlob) {
-                    status = NCryptCreateClaim(0, hAik, NCRYPT_CLAIM_PLATFORM, &paramList, claimBlob, cbClaim, &cbClaim, 0);
-                    if (status == ERROR_SUCCESS) {
-                        printf("[+] TPM platform claim generated (%lu bytes).\n", cbClaim);
-                        printf("Header: ");
-                        DWORD previewLen = cbClaim > 16 ? 16 : cbClaim;
-                        for (DWORD j = 0; j < previewLen; ++j) printf("%02x", claimBlob[j]);
-                        printf("\n");
-                    }
-                    else {
-                        fprintf(stderr, "[-] NCryptCreateClaim failed. Code: 0x%08lX\n", (unsigned long)status);
-                    }
-                    free(claimBlob);
-                }
-            }
-            NCryptFreeObject(hAik);
-        }
-        else {
-            fprintf(stderr, "[-] Failed to open/create AIK.\n");
-        }
-        NCryptFreeObject(hProv);
-    }
-    else {
-        fprintf(stderr, "[-] Failed to open Platform Crypto Provider.\n");
-    }
-
     for (uint32_t i = 0; i < 24; ++i) {
         pcreventlist_free(&pcrEvents[i]);
     }
     free(logBuffer);
     Tbsip_Context_Close(hTbsContext);
 
-    return !passthroughDetected;
+    return (!passthroughDetected);
 }
