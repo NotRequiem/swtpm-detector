@@ -96,6 +96,21 @@ BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
     return TRUE;
 }
 
+static bool is_admin() {
+    bool is_admin = false;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION elevation = { 0 };
+        DWORD dwSize;
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &dwSize)) {
+            if (elevation.TokenIsElevated)
+                is_admin = true;
+        }
+        CloseHandle(hToken);
+    }
+    return is_admin;
+}
+
 BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert,
     const BYTE* ekPub,
     DWORD ekPubSize,
@@ -113,6 +128,11 @@ BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert,
     printf("  EK public key matches the EK certificate public key.\n");
 
     if (!manual_ek_chain_walk(ekCert, hCabRoots, hCandidateStore, 0, outPath, NULL, stdout)) {
+        return FALSE;
+    }
+
+    if (!is_admin()) {
+        printf("[!] Admin permissions required to perform the EK challenge. If this check doesn't run, the TPM can be spoofed by just dumping a valid public EK.\n");
         return FALSE;
     }
 
@@ -168,7 +188,7 @@ int wmain(int argc, wchar_t* argv[]) {
     HCERTSTORE hCandidateStore = NULL;
 
     for (int i = 1; i < argc; ++i) {
-        if ((_wcsicmp(argv[i], L"--cab") == 0 || _wcsicmp(argv[i], L"-c") == 0) && (i + 1 < argc)) {
+        if ((_wcsicmp(argv[i], L"--cab") == 0 || _wcsicmp(argv[i], L"-c") == 0 || _wcsicmp(argv[i], L"-C") == 0) && (i + 1 < argc)) {
             localCabPath = argv[++i];
         }
         else if (_wcsicmp(argv[i], L"--help") == 0 || _wcsicmp(argv[i], L"-h") == 0) {
@@ -284,7 +304,7 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     if (!ok) {
-        printf("\n\nResult: TPM is not trustable. Not chain-verified to a vendor certificate.\n");
+        printf("\n\nResult: TPM is not trustable.\n");
         goto cleanup;
     }
 
