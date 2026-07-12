@@ -9,7 +9,7 @@
 > **`passthrough detection`**
 - Checks if PCRs 1-7 mathematically reconstructed from TCG logs and actual hardware PCRs mismatch.
 - PCR0 is excluded. Firmware can place PCR0-related information into the event log without extending it.
-- The detection can be bypassed if the firmware is patched so that the TPM never measures the host's boot chain, or if the attacker (who is in control of such chain( reconstructs the VM's TCG logs accordingly.
+- The detection can be bypassed if the firmware is patched so that the TPM never measures the host's boot chain, or if the attacker (who is in control of such chain) reconstructs the VM's TCG logs accordingly.
 
 > **`flashing/resetting detection`**
 - Changing the EPS to derive a new EK makes the manufacturer-backed credential chain broken unless the issuer re-enrolls and issues a fresh EK credential for that new EK.

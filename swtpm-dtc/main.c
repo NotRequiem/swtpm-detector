@@ -1,8 +1,6 @@
 #include "tpm_verify.h"
 #include "tpm_passthrough.h"
 
-BOOL get_ek_cert_store_directly(HCERTSTORE* out_store);
-
 BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
     HCERTSTORE hCabRoots,
     HCERTSTORE hCandidateStore,
