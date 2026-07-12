@@ -1,10 +1,10 @@
-# TPM 2.0 Integrity Tool
+# Spoofed TPM Detector
 
 > **`swtpm detection`**
 
-- Checks if the TPM is in possesion of a **private** EK chained to a real certification authority. 
+- Checks if the TPM is in possession of a **private** EK chained to a real certification authority. 
 - Can't be bypassed if the detection is implemented properly.
-- Dumping a private EK is not possible. Software can verify if you're in possesion of a private EK using a cryptographic challenge with the public EK.
+- Dumping a private EK is not possible. Software can verify if you're in possession of a private EK by asking the TPM to decipher a random blob with the public EK.
 
 > **`passthrough detection`**
 - Checks if PCRs 1-7 mathematically reconstructed from TCG logs and actual hardware PCRs mismatch.
@@ -47,5 +47,4 @@ tpm-verify.exe --cab "C:\Path\To\TrustedTpm.cab"
 ```
 
 ## Disclaimer
-This project is still in development and detections are not fully finished. 
-Don't use it for production purposes.
+This project is still in beta. Compatibility for all kind of TPMs must be finished.

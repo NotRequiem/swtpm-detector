@@ -115,13 +115,22 @@ BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert,
     if (!manual_ek_chain_walk(ekCert, hCabRoots, hCandidateStore, 0, outPath, NULL, stdout)) {
         return FALSE;
     }
+
+    if (perform_local_tpm_pop_challenge(ekCert)) {
+        printf("TPM is physical. Proved to possess the private EK.\n");
+    }
+    else {
+        printf("The TPM is spoofed with a valid certificate and EK. This is a software TPM.\n");
+        return FALSE;
+    }
+
     if (outLeaf) *outLeaf = CertDuplicateCertificateContext(ekCert);
     return TRUE;
 }
 
 static void print_tpm_banner(const TPMINFO* info) {
-    printf("TPM version from TBS: %s\n", info->isTpm2 ? "2.0" : "1.2");
-    print_ascii4("TPM manufacturer ID", info->manufacturerId);
+    printf("TPM version: %s\n", info->isTpm2 ? "2.0" : "1.2");
+    printf("TPM manufacturer ID: %lu (ASCII '%s')\n", (unsigned long)info->manufacturerId, info->manufacturerIdText);
     printf("TPM vendor string: %s\n", info->vendorString[0] ? info->vendorString : "(unknown)");
     printf("TPM firmware version: 0x%016llx\n", (unsigned long long)info->firmwareVersion);
     print_utf8_or_unknown("PCP platform type", info->providerType);
@@ -195,13 +204,8 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     printf("Extracted %Iu candidate certificate files\n", g_extracted.count);
 
-    if (!get_tpm_info_via_tbs(&info)) {
-        fprintf(stderr, "Could not obtain TPM information from TBS\n");
-        goto cleanup;
-    }
-
-    if (!get_pcp_info(&info)) {
-        fprintf(stderr, "Could not obtain TPM EK information from the Platform Crypto Provider\n");
+    if (!get_tpm_info_via_ncrypt(&info)) {
+        fprintf(stderr, "Could not obtain TPM information via NCrypt provider\n");
         goto cleanup;
     }
 
@@ -304,7 +308,7 @@ int wmain(int argc, wchar_t* argv[]) {
     printf("\n[*] Starting passthrough checks...\n");
     if (!detect_tpm_passthrough()) {
         printf("\n\nResult: Passed-through virtualized hardware detected.\n");
-        ok = FALSE; 
+        ok = FALSE;
     }
     else {
         printf("\n\nResult: Real hardware TPM verified.\n");

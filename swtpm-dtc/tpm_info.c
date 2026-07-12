@@ -1,420 +1,762 @@
 #include "tpm_verify.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <windows.h>
+#include <ncrypt.h>
+#include <strsafe.h>
+#include <tbs.h>
+#include <time.h>
 
-static void dump_hex_prefix(const char* label, const BYTE* data, DWORD size, DWORD maxBytes) {
-    DWORD n = size < maxBytes ? size : maxBytes;
-    DWORD i;
-    if (!label) label = "(null)";
-    printf("%s (%lu bytes):", label, (unsigned long)size);
-    for (i = 0; i < n; ++i) {
-        printf(" %02X", data ? data[i] : 0);
-    }
-    if (size > n) printf(" ...");
-    printf("\n");
+#pragma comment(lib, "tbs.lib")
+
+#define TPM_ST_NO_SESSIONS         0x8001
+#define TPM_ST_SESSIONS            0x8002
+#define TPM_RS_PW                  0x40000009
+#define TPM_RH_OWNER               0x40000001
+#define TPM_RH_ENDORSEMENT         0x4000000B
+#define TPM_RH_NULL                0x40000007
+
+#define TPM_CC_CreatePrimary       0x00000131
+#define TPM_CC_PolicySecret        0x00000151
+#define TPM_CC_ActivateCredential  0x00000147
+#define TPM_CC_MakeCredential      0x00000168
+#define TPM_CC_StartAuthSession    0x00000176
+#define TPM_CC_FlushContext        0x00000165
+#define TPM_CC_ReadPublic          0x00000173
+#define TPM_CC_GetCapability       0x0000017A
+
+#define TPM_ALG_RSA                0x0001
+#define TPM_ALG_SHA256             0x000B
+#define TPM_ALG_NULL               0x0010
+#define TPM_ALG_RSASSA             0x0014
+
+#define TPM_SE_POLICY              0x01
+
+#ifndef NCRYPT_PCP_TPM_VERSION_PROPERTY
+#define NCRYPT_PCP_TPM_VERSION_PROPERTY L"PCP_TPM_VERSION"
+#endif
+
+#ifndef NCRYPT_PCP_TPM_MANUFACTURER_ID_PROPERTY
+#define NCRYPT_PCP_TPM_MANUFACTURER_ID_PROPERTY L"PCP_TPM_MANUFACTURER_ID"
+#endif
+
+#ifndef NCRYPT_PCP_TPM_FW_VERSION_PROPERTY
+#define NCRYPT_PCP_TPM_FW_VERSION_PROPERTY L"PCP_TPM_FW_VERSION"
+#endif
+
+typedef struct {
+    BYTE* buf;
+    UINT32 capacity;
+    UINT32 write_pos;
+} buf_builder;
+
+typedef struct {
+    const BYTE* buf;
+    UINT32 size;
+    UINT32 read_pos;
+} buf_parser;
+
+static void init_builder(buf_builder* b, BYTE* buf, UINT32 cap) {
+    b->buf = buf;
+    b->capacity = cap;
+    b->write_pos = 0;
 }
 
-static BOOL write_u16_be(BYTE* dst, size_t dstSize, size_t offset, USHORT value) {
-    if (!dst || offset > dstSize || (dstSize - offset) < 2) return FALSE;
-    dst[offset + 0] = (BYTE)((value >> 8) & 0xFF);
-    dst[offset + 1] = (BYTE)(value & 0xFF);
+static void write_8(buf_builder* b, BYTE val) {
+    if (b->write_pos < b->capacity) b->buf[b->write_pos++] = val;
+}
+
+static void write_16(buf_builder* b, UINT16 val) {
+    if (b->write_pos + 2 <= b->capacity) {
+        b->buf[b->write_pos++] = (val >> 8) & 0xFF;
+        b->buf[b->write_pos++] = val & 0xFF;
+    }
+}
+
+static void write_32(buf_builder* b, UINT32 val) {
+    if (b->write_pos + 4 <= b->capacity) {
+        b->buf[b->write_pos++] = (val >> 24) & 0xFF;
+        b->buf[b->write_pos++] = (val >> 16) & 0xFF;
+        b->buf[b->write_pos++] = (val >> 8) & 0xFF;
+        b->buf[b->write_pos++] = val & 0xFF;
+    }
+}
+
+static void write_buf(buf_builder* b, const BYTE* src, UINT32 len) {
+    if (b->write_pos + len <= b->capacity) {
+        memcpy(b->buf + b->write_pos, src, len);
+        b->write_pos += len;
+    }
+}
+
+static void write_2b(buf_builder* b, const BYTE* src, UINT16 len) {
+    write_16(b, len);
+    write_buf(b, src, len);
+}
+
+static void patch_32(BYTE* buf, UINT32 offset, UINT32 val) {
+    buf[offset] = (val >> 24) & 0xFF;
+    buf[offset + 1] = (val >> 16) & 0xFF;
+    buf[offset + 2] = (val >> 8) & 0xFF;
+    buf[offset + 3] = val & 0xFF;
+}
+
+static void init_parser(buf_parser* p, const BYTE* buf, UINT32 size) {
+    p->buf = buf;
+    p->size = size;
+    p->read_pos = 0;
+}
+
+static BYTE read_8(buf_parser* p) {
+    if (p->read_pos < p->size) return p->buf[p->read_pos++];
+    return 0;
+}
+
+static UINT16 read_16(buf_parser* p) {
+    if (p->read_pos + 2 <= p->size) {
+        UINT16 val = (p->buf[p->read_pos] << 8) | p->buf[p->read_pos + 1];
+        p->read_pos += 2;
+        return val;
+    }
+    return 0;
+}
+
+static UINT32 read_32(buf_parser* p) {
+    if (p->read_pos + 4 <= p->size) {
+        UINT32 val = ((UINT32)p->buf[p->read_pos] << 24) |
+            ((UINT32)p->buf[p->read_pos + 1] << 16) |
+            ((UINT32)p->buf[p->read_pos + 2] << 8) |
+            ((UINT32)p->buf[p->read_pos + 3]);
+        p->read_pos += 4;
+        return val;
+    }
+    return 0;
+}
+
+static void read_buf(buf_parser* p, BYTE* dst, UINT32 len) {
+    if (p->read_pos + len <= p->size) {
+        memcpy(dst, p->buf + p->read_pos, len);
+        p->read_pos += len;
+    }
+}
+
+static UINT16 read_2b(buf_parser* p, BYTE* dst, UINT16 max_len) {
+    UINT16 len = read_16(p);
+    if (len > max_len || p->read_pos + len > p->size) return 0;
+    read_buf(p, dst, len);
+    return len;
+}
+
+static void generate_stack_random(BYTE* out_buf, UINT32 len) {
+    ULONG_PTR stack_addr = (ULONG_PTR)&stack_addr;
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    UINT64 seed = (UINT64)stack_addr ^ (UINT64)qpc.QuadPart;
+    for (UINT32 i = 0; i < len; i++) {
+        seed ^= (seed << 13);
+        seed ^= (seed >> 7);
+        seed ^= (seed << 17);
+        out_buf[i] = (BYTE)(seed & 0xFF);
+    }
+}
+
+static BOOL send_tpm_command(TBS_HCONTEXT h_tbs_context, const BYTE* cmd_buf, UINT32 cmd_size, BYTE* resp_buf, UINT32* resp_size) {
+    TBS_RESULT hr = Tbsip_Submit_Command(
+        h_tbs_context,
+        TBS_COMMAND_LOCALITY_ZERO,
+        TBS_COMMAND_PRIORITY_NORMAL,
+        cmd_buf,
+        cmd_size,
+        resp_buf,
+        resp_size
+    );
+    if (hr != TBS_SUCCESS) {
+        printf("[!] TBS Submit failed: 0x%08X\n", hr);
+        return FALSE;
+    }
     return TRUE;
 }
 
-BOOL read_ncrypt_property_bytes(NCRYPT_PROV_HANDLE hProv, LPCWSTR prop, BYTE** outBuf, DWORD* outSize) {
+static BOOL tpm_read_public(TBS_HCONTEXT h_tbs_context, UINT32 handle, BYTE* out_name, UINT16* out_name_size) {
+    BYTE cmd[128];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_NO_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_ReadPublic);
+    write_32(&b, handle);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p); read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        printf("[!] ReadPublic failed on handle 0x%08X with RC: 0x%08X\n", handle, rc);
+        return FALSE;
+    }
+
+    UINT16 out_public_size = read_16(&p);
+    p.read_pos += out_public_size;
+
+    *out_name_size = read_2b(&p, out_name, 128);
+    return (*out_name_size > 0);
+}
+
+static BOOL tpm_create_primary_ak(TBS_HCONTEXT h_tbs_context, UINT32* out_ak_handle) {
+    BYTE in_public[128];
+    buf_builder pb;
+    init_builder(&pb, in_public, sizeof(in_public));
+    write_16(&pb, TPM_ALG_RSA);
+    write_16(&pb, TPM_ALG_SHA256);
+    write_32(&pb, 0x00050072);
+    write_16(&pb, 0);
+    write_16(&pb, TPM_ALG_NULL);
+    write_16(&pb, TPM_ALG_RSASSA);
+    write_16(&pb, TPM_ALG_SHA256);
+    write_16(&pb, 2048);
+    write_32(&pb, 0);
+    write_16(&pb, 0);
+    UINT16 in_public_size = (UINT16)pb.write_pos;
+
+    BYTE cmd[1024];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+    write_16(&b, TPM_ST_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_CreatePrimary);
+    write_32(&b, TPM_RH_OWNER);
+
+    write_32(&b, 9);
+    write_32(&b, TPM_RS_PW);
+    write_16(&b, 0);
+    write_8(&b, 0);
+    write_16(&b, 0);
+
+    write_16(&b, 4);
+    write_16(&b, 0);
+    write_16(&b, 0);
+
+    write_16(&b, in_public_size);
+    write_buf(&b, in_public, in_public_size);
+    write_16(&b, 0);
+    write_32(&b, 0);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p); read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        printf("[!] CreatePrimary (AK) failed with RC: 0x%08X\n", rc);
+        return FALSE;
+    }
+
+    *out_ak_handle = read_32(&p);
+    return TRUE;
+}
+
+static BOOL tpm_start_auth_session(TBS_HCONTEXT h_tbs_context, UINT32* out_session_handle) {
+    BYTE cmd[256];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_NO_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_StartAuthSession);
+    write_32(&b, TPM_RH_NULL);
+    write_32(&b, TPM_RH_NULL);
+
+    BYTE dummy_nonce[20] = { 0 };
+    write_2b(&b, dummy_nonce, 20);
+    write_16(&b, 0);
+    write_8(&b, TPM_SE_POLICY);
+    write_16(&b, TPM_ALG_NULL);
+    write_16(&b, TPM_ALG_SHA256);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[512];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p); read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        printf("[!] StartAuthSession failed with RC: 0x%08X\n", rc);
+        return FALSE;
+    }
+
+    *out_session_handle = read_32(&p);
+    return TRUE;
+}
+
+static BOOL tpm_policy_secret(TBS_HCONTEXT h_tbs_context, UINT32 session_handle) {
+    BYTE cmd[256];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_PolicySecret);
+    write_32(&b, TPM_RH_ENDORSEMENT);
+    write_32(&b, session_handle);
+
+    write_32(&b, 9);
+    write_32(&b, TPM_RS_PW);
+    write_16(&b, 0);
+    write_8(&b, 0);
+    write_16(&b, 0);
+
+    write_16(&b, 0);
+    write_16(&b, 0);
+    write_16(&b, 0);
+    write_32(&b, 0);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[512];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p); read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        printf("[!] PolicySecret failed with RC: 0x%08X\n", rc);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL tpm_make_credential(TBS_HCONTEXT h_tbs_context, UINT32 ek_handle, const BYTE* challenge, UINT16 challenge_size,
+    const BYTE* ak_name, UINT16 ak_name_size,
+    BYTE* out_blob, UINT16* out_blob_size,
+    BYTE* out_secret, UINT16* out_secret_size) {
+    BYTE cmd[2048];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_NO_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_MakeCredential);
+    write_32(&b, ek_handle);
+
+    write_2b(&b, challenge, challenge_size);
+    write_2b(&b, ak_name, ak_name_size);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p); read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        printf("[!] MakeCredential failed with RC: 0x%08X\n", rc);
+        return FALSE;
+    }
+
+    *out_blob_size = read_2b(&p, out_blob, 1024);
+    *out_secret_size = read_2b(&p, out_secret, 1024);
+    return (*out_blob_size > 0 && *out_secret_size > 0);
+}
+
+static BOOL tpm_activate_credential(TBS_HCONTEXT h_tbs_context, UINT32 ak_handle, UINT32 ek_handle, UINT32 policy_session_handle,
+    const BYTE* blob, UINT16 blob_size,
+    const BYTE* secret, UINT16 secret_size,
+    BYTE* out_decrypted, UINT16* out_decrypted_size) {
+    BYTE cmd[4096];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_ActivateCredential);
+    write_32(&b, ak_handle);
+    write_32(&b, ek_handle);
+
+    write_32(&b, 18);
+
+    write_32(&b, TPM_RS_PW);
+    write_16(&b, 0);
+    write_8(&b, 0);
+    write_16(&b, 0);
+
+    write_32(&b, policy_session_handle);
+    write_16(&b, 0);
+    write_8(&b, 0);
+    write_16(&b, 0);
+
+    write_2b(&b, blob, blob_size);
+    write_2b(&b, secret, secret_size);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[2048];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    UINT16 tag = read_16(&p);
+    read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        printf("[!] ActivateCredential failed with RC: 0x%08X\n", rc);
+        return FALSE;
+    }
+
+    if (tag == TPM_ST_SESSIONS) {
+        read_32(&p);
+    }
+
+    *out_decrypted_size = read_2b(&p, out_decrypted, 128);
+    return (*out_decrypted_size > 0);
+}
+
+static void tpm_flush_context(TBS_HCONTEXT h_tbs_context, UINT32 handle) {
+    BYTE cmd[64];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_NO_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_FlushContext);
+    write_32(&b, handle);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[64];
+    UINT32 resp_size = sizeof(resp);
+    send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size);
+}
+
+static BOOL tpm_enumerate_persistent_handles(TBS_HCONTEXT h_tbs_context, UINT32* out_handles, UINT32* out_count) {
+    BYTE cmd[128];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_NO_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_GetCapability);
+    write_32(&b, 0x00000001);
+    write_32(&b, 0x81000000);
+    write_32(&b, 64);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p); read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) return FALSE;
+
+    read_8(&p);
+    UINT32 returned_cap = read_32(&p);
+    if (returned_cap != 0x00000001) return FALSE;
+
+    UINT32 count = read_32(&p);
+    if (count > 64) count = 64;
+    *out_count = count;
+
+    for (UINT32 i = 0; i < count; i++) {
+        out_handles[i] = read_32(&p);
+    }
+    return TRUE;
+}
+
+static BOOL execute_possession_challenge(TBS_HCONTEXT h_tbs_context, UINT32 ek_handle, UINT32 ak_handle) {
+    BYTE ek_name[128];
+    UINT16 ek_name_size = 0;
+    BYTE ak_name[128];
+    UINT16 ak_name_size = 0;
+
+    if (!tpm_read_public(h_tbs_context, ek_handle, ek_name, &ek_name_size)) return FALSE;
+    if (!tpm_read_public(h_tbs_context, ak_handle, ak_name, &ak_name_size)) return FALSE;
+
+    printf("[*] Initiating Auth Policy Session...\n");
+    UINT32 policy_session = 0;
+    if (!tpm_start_auth_session(h_tbs_context, &policy_session)) return FALSE;
+
+    printf("[*] Satisfying EK policy context...\n");
+    if (!tpm_policy_secret(h_tbs_context, policy_session)) {
+        tpm_flush_context(h_tbs_context, policy_session);
+        return FALSE;
+    }
+
+    BYTE challenge[16];
+    generate_stack_random(challenge, 16);
+    printf("[*] Formulating challenge payload: ");
+    for (int i = 0; i < 16; i++) {
+        printf("%02X", challenge[i]);
+    }
+    printf("\n");
+
+    printf("[*] Wrapping challenge payload (MakeCredential)...\n");
+    BYTE blob[1024];
+    UINT16 blob_size = 0;
+    BYTE secret[1024];
+    UINT16 secret_size = 0;
+    if (!tpm_make_credential(h_tbs_context, ek_handle, challenge, 16, ak_name, ak_name_size, blob, &blob_size, secret, &secret_size)) {
+        tpm_flush_context(h_tbs_context, policy_session);
+        return FALSE;
+    }
+
+    printf("[*] Requesting decryption validation (ActivateCredential)...\n");
+    BYTE decrypted_challenge[128];
+    UINT16 decrypted_size = 0;
+    BOOL validated = tpm_activate_credential(h_tbs_context, ak_handle, ek_handle, policy_session, blob, blob_size, secret, secret_size, decrypted_challenge, &decrypted_size);
+
+    tpm_flush_context(h_tbs_context, policy_session);
+
+    if (validated && decrypted_size == 16 && memcmp(challenge, decrypted_challenge, 16) == 0) {
+        printf("[+] Success: Returned bytes match the challenge.\n");
+        return TRUE;
+    }
+    printf("[-] Decrypted credential mismatch.\n");
+    return FALSE;
+}
+
+BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ek_cert) {
+    UNREFERENCED_PARAMETER(ek_cert);
+
+    TBS_CONTEXT_PARAMS2 params;
+    params.version = TBS_CONTEXT_VERSION_TWO;
+    params.includeTpm12 = 0;
+    params.includeTpm20 = 1;
+    TBS_HCONTEXT h_tbs_context = 0;
+
+    printf("[*] Connecting to TPM...\n");
+    TBS_RESULT tr = Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &h_tbs_context);
+    if (tr != TBS_SUCCESS) {
+        printf("[!] TBS connection failed: 0x%08X\n", tr);
+        return FALSE;
+    }
+    printf("[+] TBS connected.\n");
+
+    UINT32 handles[64] = { 0 };
+    UINT32 handle_count = 0;
+    UINT32 preinstalled_ek_handle = 0;
+
+    if (tpm_enumerate_persistent_handles(h_tbs_context, handles, &handle_count)) {
+        for (UINT32 i = 0; i < handle_count; i++) {
+            if (handles[i] >= 0x81010000 && handles[i] <= 0x810100FF) {
+                preinstalled_ek_handle = handles[i];
+                break;
+            }
+        }
+    }
+
+    if (preinstalled_ek_handle == 0) {
+        printf("[!] Error: No preinstalled persistent EK detected.\n");
+        Tbsip_Context_Close(h_tbs_context);
+        return FALSE;
+    }
+    printf("[+] Preinstalled EK handle located: 0x%08X\n", preinstalled_ek_handle);
+
+    printf("[*] Loading transient AK under Owner hierarchy...\n");
+    UINT32 ak_handle = 0;
+    if (!tpm_create_primary_ak(h_tbs_context, &ak_handle)) {
+        printf("[!] Failed to load transient AK.\n");
+        Tbsip_Context_Close(h_tbs_context);
+        return FALSE;
+    }
+    printf("[+] Transient AK loaded: 0x%08X\n", ak_handle);
+
+    BOOL path_success = execute_possession_challenge(h_tbs_context, preinstalled_ek_handle, ak_handle);
+
+    tpm_flush_context(h_tbs_context, ak_handle);
+    Tbsip_Context_Close(h_tbs_context);
+
+    return path_success;
+}
+
+BOOL read_ncrypt_property_bytes(NCRYPT_PROV_HANDLE h_prov, LPCWSTR prop, BYTE** out_buf, DWORD* out_size) {
     DWORD size = 0;
     SECURITY_STATUS s;
     BYTE* buf;
 
-    if (!outBuf || !outSize) return FALSE;
-    *outBuf = NULL;
-    *outSize = 0;
+    if (!out_buf || !out_size) return FALSE;
+    *out_buf = NULL;
+    *out_size = 0;
 
-    s = NCryptGetProperty(hProv, prop, NULL, 0, &size, 0);
+    s = NCryptGetProperty(h_prov, prop, NULL, 0, &size, 0);
     if (s != ERROR_SUCCESS && s != NTE_BUFFER_TOO_SMALL) {
-        print_ntstatus("NCryptGetProperty(size)", s);
         return FALSE;
     }
 
     buf = (BYTE*)malloc(size ? size : 1);
     if (!buf) return FALSE;
 
-    s = NCryptGetProperty(hProv, prop, buf, size, &size, 0);
+    s = NCryptGetProperty(h_prov, prop, buf, size, &size, 0);
     if (s != ERROR_SUCCESS) {
-        print_ntstatus("NCryptGetProperty(data)", s);
         free(buf);
         return FALSE;
     }
 
-    *outBuf = buf;
-    *outSize = size;
+    *out_buf = buf;
+    *out_size = size;
     return TRUE;
 }
 
-BOOL read_ncrypt_property_string(NCRYPT_PROV_HANDLE hProv, LPCWSTR prop, char* out, size_t outChars) {
+BOOL read_ncrypt_property_string(NCRYPT_PROV_HANDLE h_prov, LPCWSTR prop, char* out, size_t out_chars) {
     DWORD size = 0;
     SECURITY_STATUS s;
-    WCHAR* wbuf = NULL;
+    WCHAR* w_buf = NULL;
 
-    if (!out || outChars == 0) return FALSE;
+    if (!out || out_chars == 0) return FALSE;
     out[0] = '\0';
 
-    s = NCryptGetProperty(hProv, prop, NULL, 0, &size, 0);
+    s = NCryptGetProperty(h_prov, prop, NULL, 0, &size, 0);
     if (s != ERROR_SUCCESS && s != NTE_BUFFER_TOO_SMALL) {
         return FALSE;
     }
 
-    wbuf = (WCHAR*)calloc(1, size + sizeof(WCHAR));
-    if (!wbuf) return FALSE;
+    w_buf = (WCHAR*)calloc(1, size + sizeof(WCHAR));
+    if (!w_buf) return FALSE;
 
-    s = NCryptGetProperty(hProv, prop, (PBYTE)wbuf, size, &size, 0);
+    s = NCryptGetProperty(h_prov, prop, (PBYTE)w_buf, size, &size, 0);
     if (s != ERROR_SUCCESS) {
-        free(wbuf);
+        free(w_buf);
         return FALSE;
     }
 
-    wbuf[size / sizeof(WCHAR)] = L'\0';
-    if (!WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)outChars, NULL, NULL)) {
-        free(wbuf);
+    w_buf[size / sizeof(WCHAR)] = L'\0';
+    if (!WideCharToMultiByte(CP_UTF8, 0, w_buf, -1, out, (int)out_chars, NULL, NULL)) {
+        free(w_buf);
         return FALSE;
     }
 
-    free(wbuf);
+    free(w_buf);
     return TRUE;
 }
 
-void load_certs_from_registry_recursive(HKEY hKey, HCERTSTORE store, WCHAR* szValueName) {
-    DWORD dwIndex = 0;
-    DWORD cbValueName = 16384;
-    DWORD dwType = 0;
-    BYTE* lpData = NULL;
-    DWORD cbData = 0;
-
-    if (!hKey || !store || !szValueName) return;
-
-    while (TRUE) {
-        cbValueName = 16384;
-        cbData = 0;
-
-        LONG lResult = RegEnumValueW(hKey, dwIndex, szValueName, &cbValueName, NULL, &dwType, NULL, &cbData);
-        if (lResult == ERROR_NO_MORE_ITEMS) {
-            break;
+static void parse_platform_type_string(TPMINFO* info) {
+    const char* p_version = strstr(info->providerType, "TPM-Version:");
+    if (p_version) {
+        p_version += 12;
+        if (strncmp(p_version, "2.0", 3) == 0) {
+            info->isTpm2 = TRUE;
+            info->tpmVersionRaw = 2;
         }
+        else if (strncmp(p_version, "1.2", 3) == 0) {
+            info->isTpm2 = FALSE;
+            info->tpmVersionRaw = 1;
+        }
+    }
 
-        if (lResult == ERROR_SUCCESS || lResult == ERROR_MORE_DATA) {
-            if (dwType == REG_BINARY && cbData > 0) {
-                lpData = (BYTE*)malloc(cbData);
-                if (lpData) {
-                    cbValueName = 16384;
-                    lResult = RegEnumValueW(hKey, dwIndex, szValueName, &cbValueName, NULL, &dwType, lpData, &cbData);
-                    if (lResult == ERROR_SUCCESS) {
-                        PCCERT_CONTEXT ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, lpData, cbData);
-                        if (ctx) {
-                            CertAddCertificateContextToStore(store, ctx, CERT_STORE_ADD_NEW, NULL);
-                            CertFreeCertificateContext(ctx);
-                        }
-                    }
-                    free(lpData);
-                    lpData = NULL;
-                }
+    const char* p_vendor = strstr(info->providerType, "VendorID:'");
+    if (p_vendor) {
+        p_vendor += 10;
+        char vendor[5] = { 0 };
+        int i = 0;
+        while (p_vendor[i] && p_vendor[i] != '\'' && i < 4) {
+            vendor[i] = p_vendor[i];
+            i++;
+        }
+        vendor[i] = '\0';
+        if (i > 0) {
+            StringCchCopyA(info->manufacturerIdText, _countof(info->manufacturerIdText), vendor);
+            DWORD mfg_id = 0;
+            for (int k = 0; k < i; k++) {
+                mfg_id = (mfg_id << 8) | (BYTE)vendor[k];
             }
-        }
-        dwIndex++;
-    }
-
-    dwIndex = 0;
-    WCHAR szSubKeyName[256];
-    DWORD cbSubKeyName = _countof(szSubKeyName);
-    while (TRUE) {
-        cbSubKeyName = _countof(szSubKeyName);
-        LONG lResult = RegEnumKeyExW(hKey, dwIndex, szSubKeyName, &cbSubKeyName, NULL, NULL, NULL, NULL);
-        if (lResult == ERROR_NO_MORE_ITEMS) {
-            break;
-        }
-        if (lResult == ERROR_SUCCESS) {
-            HKEY hSubKey = NULL;
-            if (RegOpenKeyExW(hKey, szSubKeyName, 0, KEY_READ, &hSubKey) == ERROR_SUCCESS) {
-                load_certs_from_registry_recursive(hSubKey, store, szValueName);
-                RegCloseKey(hSubKey);
+            for (int k = i; k < 4; k++) {
+                mfg_id = (mfg_id << 8);
             }
+            info->manufacturerId = mfg_id;
         }
-        dwIndex++;
+    }
+
+    if (!info->vendorString[0] || strcmp(info->vendorString, "----") == 0) {
+        StringCchCopyA(info->vendorString, _countof(info->vendorString), info->manufacturerIdText);
     }
 }
 
-void load_tpm_intermediate_certs_from_registry(HCERTSTORE store) {
-    HKEY hKey = NULL;
-    WCHAR* szValueName = (WCHAR*)malloc(16384 * sizeof(WCHAR));
-    if (!szValueName) return;
-
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\TPM\\WMI\\Endorsement", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        load_certs_from_registry_recursive(hKey, store, szValueName);
-        RegCloseKey(hKey);
-    }
-    free(szValueName);
-}
-
-void load_certs_from_pcp_property_store(NCRYPT_PROV_HANDLE hProv, LPCWSTR propName, HCERTSTORE hStoreToAddTo) {
-    HCERTSTORE hPcpStore = NULL;
-    DWORD cbStore = sizeof(hPcpStore);
-    SECURITY_STATUS s = NCryptGetProperty(hProv, propName, (PBYTE)&hPcpStore, sizeof(hPcpStore), &cbStore, 0);
-    if (s == ERROR_SUCCESS && hPcpStore) {
-        PCCERT_CONTEXT c = NULL;
-        DWORD loadedCount = 0;
-        while ((c = CertEnumCertificatesInStore(hPcpStore, c)) != NULL) {
-            if (CertAddCertificateContextToStore(hStoreToAddTo, c, CERT_STORE_ADD_NEW, NULL)) {
-                loadedCount++;
-            }
-        }
-        CertCloseStore(hPcpStore, 0);
-        if (loadedCount > 0) {
-            wprintf(L"  Loaded %lu intermediate certificate(s) from PCP property: %s\n", loadedCount, propName);
-        }
-    }
-}
-
-void load_pcp_intermediate_certs(HCERTSTORE store) {
-    NCRYPT_PROV_HANDLE hProv = 0;
-    SECURITY_STATUS s = NCryptOpenStorageProvider(&hProv, MS_PLATFORM_CRYPTO_PROVIDER, 0);
-    if (s == ERROR_SUCCESS) {
-        load_certs_from_pcp_property_store(hProv, L"PCP_RSA_EKNVCERT", store);
-        load_certs_from_pcp_property_store(hProv, L"PCP_ECC_EKNVCERT", store);
-        load_certs_from_pcp_property_store(hProv, L"PCP_EKNVCERT", store);
-        load_certs_from_pcp_property_store(hProv, L"PCP_INTERMEDIATE_CA_EKCERT", store);
-        NCryptFreeObject(hProv);
-    }
-}
-
-BOOL build_candidate_issuer_store(HCERTSTORE hCabStore, HCERTSTORE hRoots, HCERTSTORE hCaStore, HCERTSTORE* outStore) {
-    HCERTSTORE hStore = NULL;
-    HCERTSTORE hLmRoots = NULL;
-    HCERTSTORE hLmCa = NULL;
-    PCCERT_CONTEXT c = NULL;
-
-    if (!outStore) return FALSE;
-    *outStore = NULL;
-
-    hStore = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
-    if (!hStore) {
-        print_last_error("CertOpenStore(candidate)");
-        return FALSE;
-    }
-
-    if (hCabStore) {
-        while ((c = CertEnumCertificatesInStore(hCabStore, c)) != NULL) {
-            CertAddCertificateContextToStore(hStore, c, CERT_STORE_ADD_ALWAYS, NULL);
-        }
-    }
-
-    c = NULL;
-    if (hRoots) {
-        while ((c = CertEnumCertificatesInStore(hRoots, c)) != NULL) {
-            CertAddCertificateContextToStore(hStore, c, CERT_STORE_ADD_ALWAYS, NULL);
-        }
-    }
-
-    c = NULL;
-    if (hCaStore) {
-        while ((c = CertEnumCertificatesInStore(hCaStore, c)) != NULL) {
-            CertAddCertificateContextToStore(hStore, c, CERT_STORE_ADD_ALWAYS, NULL);
-        }
-    }
-
-    hLmRoots = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
-        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
-        "ROOT");
-    if (hLmRoots) {
-        c = NULL;
-        while ((c = CertEnumCertificatesInStore(hLmRoots, c)) != NULL) {
-            CertAddCertificateContextToStore(hStore, c, CERT_STORE_ADD_ALWAYS, NULL);
-        }
-    }
-
-    hLmCa = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
-        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
-        "CA");
-    if (hLmCa) {
-        c = NULL;
-        while ((c = CertEnumCertificatesInStore(hLmCa, c)) != NULL) {
-            CertAddCertificateContextToStore(hStore, c, CERT_STORE_ADD_ALWAYS, NULL);
-        }
-    }
-
-    {
-        HCERTSTORE hEntRoot = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
-            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
-            "Enterprise Root");
-        if (hEntRoot) {
-            c = NULL;
-            while ((c = CertEnumCertificatesInStore(hEntRoot, c)) != NULL) {
-                CertAddCertificateContextToStore(hStore, c, CERT_STORE_ADD_ALWAYS, NULL);
-            }
-            CertCloseStore(hEntRoot, 0);
-        }
-    }
-
-    load_tpm_intermediate_certs_from_registry(hStore);
-    load_pcp_intermediate_certs(hStore);
-
-    if (hLmRoots) CertCloseStore(hLmRoots, 0);
-    if (hLmCa) CertCloseStore(hLmCa, 0);
-
-    *outStore = hStore;
-    return TRUE;
-}
-
-BOOL get_tpm_info_via_tbs(TPMINFO* info) {
+BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
     ZeroMemory(info, sizeof(*info));
-
-    TBS_CONTEXT_PARAMS2 params;
-    ZeroMemory(&params, sizeof(params));
-    params.version = TPM_VERSION_20;
-    params.includeTpm20 = 1;
-    params.includeTpm12 = 1;
-
-    TBS_HCONTEXT hContext = 0;
-    TBS_RESULT r = Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &hContext);
-    if (r != TBS_SUCCESS) {
-        print_tbs_result("Tbsi_Context_Create", r);
-        return FALSE;
-    }
-
-    TPM_DEVICE_INFO deviceInfo;
-    ZeroMemory(&deviceInfo, sizeof(deviceInfo));
-    deviceInfo.structVersion = TPM_VERSION_20;
-
-    r = Tbsi_GetDeviceInfo(sizeof(deviceInfo), &deviceInfo);
-    if (r == TBS_SUCCESS) {
-        info->hasTpm = TRUE;
-        info->tpmVersionRaw = deviceInfo.tpmVersion;
-        info->isTpm2 = (deviceInfo.tpmVersion == TPM_VERSION_20);
-    }
-    else {
-        print_tbs_result("Tbsi_GetDeviceInfo", r);
-    }
-
-    if (info->isTpm2) {
-        BYTE cmd[22] = { 0 };
-        BYTE rsp[512];
-        UINT32 cbRsp = sizeof(rsp);
-        const uint16_t tag = 0x8001;
-        const uint32_t cc = 0x0000017A;
-        const uint32_t capability = 0x00000006;
-        const uint32_t property = 0x00000105;
-        const uint32_t count = 8;
-
-    #define WRITE16(p,v) do { (p)[0] = (BYTE)(((v) >> 8) & 0xFF); (p)[1] = (BYTE)((v) & 0xFF); } while (0)
-    #define WRITE32(p,v) do { (p)[0] = (BYTE)(((v) >> 24) & 0xFF); (p)[1] = (BYTE)(((v) >> 16) & 0xFF); (p)[2] = (BYTE)(((v) >> 8) & 0xFF); (p)[3] = (BYTE)((v) & 0xFF); } while (0)
-
-        WRITE16(cmd + 0, tag);
-        WRITE32(cmd + 2, sizeof(cmd));
-        WRITE32(cmd + 6, cc);
-        WRITE32(cmd + 10, capability);
-        WRITE32(cmd + 14, property);
-        WRITE32(cmd + 18, count);
-
-    #undef WRITE16
-    #undef WRITE32
-
-        r = Tbsip_Submit_Command(hContext, TBS_COMMAND_LOCALITY_ZERO, TBS_COMMAND_PRIORITY_HIGH,
-            cmd, sizeof(cmd), rsp, &cbRsp);
-        if (r == TBS_SUCCESS && cbRsp >= 22) {
-            uint32_t respCode = ((uint32_t)rsp[6] << 24) | ((uint32_t)rsp[7] << 16) |
-                ((uint32_t)rsp[8] << 8) | rsp[9];
-            if (respCode == 0) {
-                size_t off = 10;
-                BYTE moreData = rsp[off++];
-                uint32_t returnedCapability = ((uint32_t)rsp[off] << 24) | ((uint32_t)rsp[off + 1] << 16) |
-                    ((uint32_t)rsp[off + 2] << 8) | rsp[off + 3];
-                off += 4;
-                uint32_t propertyCount = ((uint32_t)rsp[off] << 24) | ((uint32_t)rsp[off + 1] << 16) |
-                    ((uint32_t)rsp[off + 2] << 8) | rsp[off + 3];
-                off += 4;
-                (void)moreData;
-
-                if (returnedCapability == capability) {
-                    for (uint32_t i = 0; i < propertyCount && off + 8 <= cbRsp; ++i) {
-                        uint32_t prop = ((uint32_t)rsp[off] << 24) | ((uint32_t)rsp[off + 1] << 16) |
-                            ((uint32_t)rsp[off + 2] << 8) | rsp[off + 3];
-                        uint32_t val = ((uint32_t)rsp[off + 4] << 24) | ((uint32_t)rsp[off + 5] << 16) |
-                            ((uint32_t)rsp[off + 6] << 8) | rsp[off + 7];
-                        off += 8;
-
-                        if (prop == 0x00000105) {
-                            info->manufacturerId = val;
-                        }
-                        else if (prop == 0x00000100) {
-                            info->familyIndicatorText[0] = (char)((val >> 24) & 0xFF);
-                            info->familyIndicatorText[1] = (char)((val >> 16) & 0xFF);
-                            info->familyIndicatorText[2] = (char)((val >> 8) & 0xFF);
-                            info->familyIndicatorText[3] = (char)(val & 0xFF);
-                            info->familyIndicatorText[4] = '\0';
-                        }
-                        else if (prop >= 0x00000106 && prop <= 0x00000109) {
-                            size_t base = (size_t)(prop - 0x00000106) * 4;
-                            if (base + 4 <= 16) {
-                                info->vendorString[base + 0] = (char)((val >> 24) & 0xFF);
-                                info->vendorString[base + 1] = (char)((val >> 16) & 0xFF);
-                                info->vendorString[base + 2] = (char)((val >> 8) & 0xFF);
-                                info->vendorString[base + 3] = (char)(val & 0xFF);
-                                info->vendorString[16] = '\0';
-                            }
-                        }
-                        else if (prop == 0x0000010B) {
-                            info->firmwareVersion1 = val;
-                        }
-                        else if (prop == 0x0000010C) {
-                            info->firmwareVersion2 = val;
-                        }
-                    }
-                }
-            }
-        }
-        else if (r != TBS_SUCCESS) {
-            print_tbs_result("Tbsip_Submit_Command(GetCapability)", r);
-        }
-
-        if (info->manufacturerId) {
-            info->manufacturerIdText[0] = (char)((info->manufacturerId >> 24) & 0xFF);
-            info->manufacturerIdText[1] = (char)((info->manufacturerId >> 16) & 0xFF);
-            info->manufacturerIdText[2] = (char)((info->manufacturerId >> 8) & 0xFF);
-            info->manufacturerIdText[3] = (char)(info->manufacturerId & 0xFF);
-            info->manufacturerIdText[4] = '\0';
-        }
-        else {
-            StringCchCopyA(info->manufacturerIdText, _countof(info->manufacturerIdText), "----");
-        }
-
-        if (!info->familyIndicatorText[0]) StringCchCopyA(info->familyIndicatorText, _countof(info->familyIndicatorText), "----");
-        if (!info->vendorString[0]) StringCchCopyA(info->vendorString, _countof(info->vendorString), "(unknown)");
-        info->firmwareVersion = ((ULONGLONG)info->firmwareVersion1 << 32) | info->firmwareVersion2;
-    }
-    else {
-        StringCchCopyA(info->manufacturerIdText, _countof(info->manufacturerIdText), "----");
-        StringCchCopyA(info->familyIndicatorText, _countof(info->familyIndicatorText), "----");
-        StringCchCopyA(info->vendorString, _countof(info->vendorString), "(unknown)");
-    }
-
-    Tbsip_Context_Close(hContext);
-    return TRUE;
-}
-
-BOOL get_pcp_info(TPMINFO* info) {
-    NCRYPT_PROV_HANDLE hProv = 0;
+    NCRYPT_PROV_HANDLE h_prov = 0;
     SECURITY_STATUS s;
 
-    s = NCryptOpenStorageProvider(&hProv, MS_PLATFORM_CRYPTO_PROVIDER, 0);
+    s = NCryptOpenStorageProvider(&h_prov, MS_PLATFORM_CRYPTO_PROVIDER, 0);
     if (s != ERROR_SUCCESS) {
-        print_ntstatus("NCryptOpenStorageProvider", s);
         return FALSE;
     }
 
-    if (!read_ncrypt_property_string(hProv, BCRYPT_PCP_PLATFORM_TYPE_PROPERTY, info->providerType, sizeof(info->providerType))) {
+    if (!read_ncrypt_property_string(h_prov, BCRYPT_PCP_PLATFORM_TYPE_PROPERTY, info->providerType, sizeof(info->providerType))) {
         StringCchCopyA(info->providerType, _countof(info->providerType), "(unknown)");
     }
-    if (!read_ncrypt_property_string(hProv, BCRYPT_PCP_PROVIDER_VERSION_PROPERTY, info->providerVersion, sizeof(info->providerVersion))) {
+
+    if (!read_ncrypt_property_string(h_prov, BCRYPT_PCP_PROVIDER_VERSION_PROPERTY, info->providerVersion, sizeof(info->providerVersion))) {
         StringCchCopyA(info->providerVersion, _countof(info->providerVersion), "(unknown)");
     }
 
-    if (!read_ncrypt_property_bytes(hProv, NCRYPT_PCP_EKPUB_PROPERTY, &info->ekPub, &info->ekPubSize)) {
+    DWORD tpm_ver = 0;
+    DWORD cb_read = sizeof(tpm_ver);
+    s = NCryptGetProperty(h_prov, NCRYPT_PCP_TPM_VERSION_PROPERTY, (PBYTE)&tpm_ver, sizeof(tpm_ver), &cb_read, 0);
+    if (s == ERROR_SUCCESS) {
+        info->hasTpm = TRUE;
+        info->isTpm2 = (tpm_ver == 2);
+        info->tpmVersionRaw = tpm_ver;
+    }
+
+    DWORD mfg_id = 0;
+    cb_read = sizeof(mfg_id);
+    s = NCryptGetProperty(h_prov, NCRYPT_PCP_TPM_MANUFACTURER_ID_PROPERTY, (PBYTE)&mfg_id, sizeof(mfg_id), &cb_read, 0);
+    if (s == ERROR_SUCCESS) {
+        info->manufacturerId = mfg_id;
+        info->manufacturerIdText[0] = (char)((mfg_id >> 24) & 0xFF);
+        info->manufacturerIdText[1] = (char)((mfg_id >> 16) & 0xFF);
+        info->manufacturerIdText[2] = (char)((mfg_id >> 8) & 0xFF);
+        info->manufacturerIdText[3] = (char)(mfg_id & 0xFF);
+        info->manufacturerIdText[4] = '\0';
+    }
+    else {
+        StringCchCopyA(info->manufacturerIdText, _countof(info->manufacturerIdText), "----");
+    }
+
+    ULONGLONG fw_ver = 0;
+    cb_read = sizeof(fw_ver);
+    s = NCryptGetProperty(h_prov, NCRYPT_PCP_TPM_FW_VERSION_PROPERTY, (PBYTE)&fw_ver, sizeof(fw_ver), &cb_read, 0);
+    if (s == ERROR_SUCCESS) {
+        info->firmwareVersion = fw_ver;
+        info->firmwareVersion1 = (DWORD)(fw_ver >> 32);
+        info->firmwareVersion2 = (DWORD)(fw_ver & 0xFFFFFFFF);
+    }
+
+    if (!info->familyIndicatorText[0]) {
+        StringCchCopyA(info->familyIndicatorText, _countof(info->familyIndicatorText), info->isTpm2 ? "2.0" : "1.2");
+    }
+    if (!info->vendorString[0]) {
+        StringCchCopyA(info->vendorString, _countof(info->vendorString), info->manufacturerIdText);
+    }
+
+    parse_platform_type_string(info);
+
+    if (!read_ncrypt_property_bytes(h_prov, NCRYPT_PCP_EKPUB_PROPERTY, &info->ekPub, &info->ekPubSize)) {
         info->ekPub = NULL;
         info->ekPubSize = 0;
     }
@@ -423,722 +765,202 @@ BOOL get_pcp_info(TPMINFO* info) {
     }
 
     info->hasEkCertStore = TRUE;
-    NCryptFreeObject(hProv);
+    NCryptFreeObject(h_prov);
     return TRUE;
 }
 
-BOOL get_pcp_ek_cert_store(NCRYPT_PROV_HANDLE hProv, HCERTSTORE* outStore) {
-    HCERTSTORE hStore = NULL;
-    DWORD size = sizeof(hStore);
+BOOL get_pcp_ek_cert_store(NCRYPT_PROV_HANDLE h_prov, HCERTSTORE* out_store) {
+    HCERTSTORE h_store = NULL;
+    DWORD size = sizeof(h_store);
     SECURITY_STATUS s;
-    if (!outStore) return FALSE;
-    *outStore = NULL;
+    if (!out_store) return FALSE;
+    *out_store = NULL;
 
-    s = NCryptGetProperty(hProv, NCRYPT_PCP_EKCERT_PROPERTY, (PBYTE)&hStore, sizeof(hStore), &size, 0);
+    s = NCryptGetProperty(h_prov, NCRYPT_PCP_EKCERT_PROPERTY, (PBYTE)&h_store, sizeof(h_store), &size, 0);
     if (s != ERROR_SUCCESS) {
-        print_ntstatus("NCryptGetProperty(PCP_EKCERT)", s);
         return FALSE;
     }
 
-    if (!hStore) return FALSE;
-    *outStore = hStore;
+    if (!h_store) return FALSE;
+    *out_store = h_store;
     return TRUE;
 }
 
-static BOOL tpm_namealg_to_bcrypt_alg(USHORT nameAlg, LPCWSTR* algId, DWORD* digestLen) {
-    if (!algId || !digestLen) return FALSE;
+void load_certs_from_registry_recursive(HKEY h_key, HCERTSTORE store, WCHAR* sz_value_name) {
+    DWORD dw_index = 0;
+    DWORD cb_value_name = 16384;
+    DWORD dw_type = 0;
+    BYTE* lp_data = NULL;
+    DWORD cb_data = 0;
 
-    switch (nameAlg) {
-    case 0x0004: 
-        *algId = BCRYPT_SHA1_ALGORITHM;
-        *digestLen = 20;
-        return TRUE;
-    case 0x000B: 
-        *algId = BCRYPT_SHA256_ALGORITHM;
-        *digestLen = 32;
-        return TRUE;
-    case 0x000C: 
-        *algId = BCRYPT_SHA384_ALGORITHM;
-        *digestLen = 48;
-        return TRUE;
-    case 0x000D: 
-        *algId = BCRYPT_SHA512_ALGORITHM;
-        *digestLen = 64;
-        return TRUE;
-    default:
-        return FALSE;
+    if (!h_key || !store || !sz_value_name) return;
+
+    while (TRUE) {
+        cb_value_name = 16384;
+        cb_data = 0;
+
+        LONG l_result = RegEnumValueW(h_key, dw_index, sz_value_name, &cb_value_name, NULL, &dw_type, NULL, &cb_data);
+        if (l_result == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+
+        if (l_result == ERROR_SUCCESS || l_result == ERROR_MORE_DATA) {
+            if (dw_type == REG_BINARY && cb_data > 0) {
+                lp_data = (BYTE*)malloc(cb_data);
+                if (lp_data) {
+                    cb_value_name = 16384;
+                    l_result = RegEnumValueW(h_key, dw_index, sz_value_name, &cb_value_name, NULL, &dw_type, lp_data, &cb_data);
+                    if (l_result == ERROR_SUCCESS) {
+                        PCCERT_CONTEXT ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, lp_data, cb_data);
+                        if (ctx) {
+                            CertAddCertificateContextToStore(store, ctx, CERT_STORE_ADD_NEW, NULL);
+                            CertFreeCertificateContext(ctx);
+                        }
+                    }
+                    free(lp_data);
+                    lp_data = NULL;
+                }
+            }
+        }
+        dw_index++;
+    }
+
+    dw_index = 0;
+    WCHAR sz_sub_key_name[256];
+    DWORD cb_sub_key_name = _countof(sz_sub_key_name);
+    while (TRUE) {
+        cb_sub_key_name = _countof(sz_sub_key_name);
+        LONG l_result = RegEnumKeyExW(h_key, dw_index, sz_sub_key_name, &cb_sub_key_name, NULL, NULL, NULL, NULL);
+        if (l_result == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+        if (l_result == ERROR_SUCCESS) {
+            HKEY h_sub_key = NULL;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, sz_sub_key_name, 0, KEY_READ, &h_sub_key) == ERROR_SUCCESS) {
+                load_certs_from_registry_recursive(h_sub_key, store, sz_value_name);
+                RegCloseKey(h_sub_key);
+            }
+        }
+        dw_index++;
     }
 }
 
-static BOOL KDFa_Generic(USHORT hashAlg, const BYTE* key, DWORD keySize, const char* label, const BYTE* contextU, DWORD contextUSize, DWORD bits, BYTE* outBuf) {
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_HASH_HANDLE hHash = NULL;
-    BYTE pbHashObject[1024];
-    DWORD cbHashObject = sizeof(pbHashObject);
-    DWORD bytesNeeded = (bits + 7) / 8;
-    DWORD bytesGenerated = 0;
-    DWORD counter = 1;
-    BYTE digest[64];
-    NTSTATUS status;
-    LPCWSTR bcryptAlg = NULL;
-    DWORD digestLen = 0;
+void load_tpm_intermediate_certs_from_registry(HCERTSTORE store) {
+    HKEY h_key = NULL;
+    WCHAR* sz_value_name = (WCHAR*)malloc(16384 * sizeof(WCHAR));
+    if (!sz_value_name) return;
 
-    if (!key || keySize == 0 || !label || !outBuf) return FALSE;
-
-    if (!tpm_namealg_to_bcrypt_alg(hashAlg, &bcryptAlg, &digestLen)) {
-        return FALSE;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\TPM\\WMI\\Endorsement", 0, KEY_READ, &h_key) == ERROR_SUCCESS) {
+        load_certs_from_registry_recursive(h_key, store, sz_value_name);
+        RegCloseKey(h_key);
     }
-
-    status = BCryptOpenAlgorithmProvider(&hAlg, bcryptAlg, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (status != STATUS_SUCCESS) {
-        return FALSE;
-    }
-
-    while (bytesGenerated < bytesNeeded) {
-        BYTE ctrBytes[4] = { 0 };
-        BYTE bitsBytes[4] = { 0 };
-        DWORD toCopy;
-
-        ctrBytes[0] = (BYTE)((counter >> 24) & 0xFF);
-        ctrBytes[1] = (BYTE)((counter >> 16) & 0xFF);
-        ctrBytes[2] = (BYTE)((counter >> 8) & 0xFF);
-        ctrBytes[3] = (BYTE)(counter & 0xFF);
-
-        bitsBytes[0] = (BYTE)((bits >> 24) & 0xFF);
-        bitsBytes[1] = (BYTE)((bits >> 16) & 0xFF);
-        bitsBytes[2] = (BYTE)((bits >> 8) & 0xFF);
-        bitsBytes[3] = (BYTE)(bits & 0xFF);
-
-        hHash = NULL;
-        status = BCryptCreateHash(hAlg, &hHash, pbHashObject, cbHashObject, (PUCHAR)key, keySize, 0);
-        if (status != STATUS_SUCCESS) {
-            BCryptCloseAlgorithmProvider(hAlg, 0);
-            return FALSE;
-        }
-
-        status = BCryptHashData(hHash, ctrBytes, sizeof(ctrBytes), 0);
-        if (status == STATUS_SUCCESS) {
-            status = BCryptHashData(hHash, (PUCHAR)label, (ULONG)strlen(label), 0);
-        }
-        if (status == STATUS_SUCCESS) {
-            BYTE zeroByte = 0x00;
-            status = BCryptHashData(hHash, &zeroByte, 1, 0);
-        }
-        if (status == STATUS_SUCCESS && contextU && contextUSize > 0) {
-            status = BCryptHashData(hHash, (PUCHAR)contextU, contextUSize, 0);
-        }
-        if (status == STATUS_SUCCESS) {
-            status = BCryptHashData(hHash, bitsBytes, sizeof(bitsBytes), 0);
-        }
-        if (status == STATUS_SUCCESS) {
-            status = BCryptFinishHash(hHash, digest, digestLen, 0);
-        }
-
-        BCryptDestroyHash(hHash);
-        hHash = NULL;
-
-        if (status != STATUS_SUCCESS) {
-            BCryptCloseAlgorithmProvider(hAlg, 0);
-            return FALSE;
-        }
-
-        toCopy = bytesNeeded - bytesGenerated;
-        if (toCopy > digestLen) toCopy = digestLen;
-        memcpy(outBuf + bytesGenerated, digest, toCopy);
-        bytesGenerated += toCopy;
-        counter++;
-    }
-
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return TRUE;
+    free(sz_value_name);
 }
 
-static BOOL compute_tpm_name_from_binding(const BYTE* pbIdBinding, DWORD cbIdBinding, BYTE** outName, DWORD* outNameSize) {
-    BYTE* pbRawPublic = NULL;
-    DWORD cbRawPublic = 0;
-    USHORT nameAlg = 0;
-    LPCWSTR bcryptAlg = NULL;
-    DWORD digestLen = 0;
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_HASH_HANDLE hHash = NULL;
-    DWORD cbHashObject = 0, cbRes = 0;
-    BYTE* pbHashObject = NULL;
-    BYTE* name = NULL;
-    BOOL ok = FALSE;
-    NTSTATUS status;
-
-    if (!pbIdBinding || cbIdBinding < 2 || !outName || !outNameSize) return FALSE;
-    *outName = NULL;
-    *outNameSize = 0;
-
-    {
-        DWORD publicSize = ((DWORD)pbIdBinding[0] << 8) | pbIdBinding[1];
-        if (cbIdBinding < 2 + publicSize || publicSize < 4) return FALSE;
-        pbRawPublic = (BYTE*)(pbIdBinding + 2);
-        cbRawPublic = publicSize;
-        nameAlg = (USHORT)(((USHORT)pbRawPublic[2] << 8) | pbRawPublic[3]);
-    }
-
-    if (!tpm_namealg_to_bcrypt_alg(nameAlg, &bcryptAlg, &digestLen)) {
-        return FALSE;
-    }
-
-    status = BCryptOpenAlgorithmProvider(&hAlg, bcryptAlg, NULL, 0);
-    if (status != STATUS_SUCCESS) {
-        return FALSE;
-    }
-
-    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbHashObject, sizeof(cbHashObject), &cbRes, 0);
-    if (status != STATUS_SUCCESS || cbHashObject == 0) {
-        goto cleanup;
-    }
-
-    pbHashObject = (BYTE*)malloc(cbHashObject);
-    if (!pbHashObject) goto cleanup;
-
-    status = BCryptCreateHash(hAlg, &hHash, pbHashObject, cbHashObject, NULL, 0, 0);
-    if (status != STATUS_SUCCESS) goto cleanup;
-
-    status = BCryptHashData(hHash, pbRawPublic, cbRawPublic, 0);
-    if (status != STATUS_SUCCESS) goto cleanup;
-
-    name = (BYTE*)malloc(2 + (size_t)(digestLen));
-    if (!name) goto cleanup;
-    name[0] = (BYTE)((nameAlg >> 8) & 0xFF);
-    name[1] = (BYTE)(nameAlg & 0xFF);
-
-    status = BCryptFinishHash(hHash, name + 2, digestLen, 0);
-    if (status != STATUS_SUCCESS) goto cleanup;
-
-    *outName = name;
-    *outNameSize = 2 + digestLen;
-    name = NULL;
-    ok = TRUE;
-
-cleanup:
-    if (name) free(name);
-    if (hHash) BCryptDestroyHash(hHash);
-    if (pbHashObject) free(pbHashObject);
-    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
-    return ok;
-}
-
-static BOOL build_tpm2b_id_object(const BYTE* hmac, DWORD hmacLen, const BYTE* encIdentity, DWORD encIdentityLen, BYTE** outBlob, DWORD* outBlobSize) {
-    size_t innerSize;
-    size_t totalSize;
-    BYTE* blob = NULL;
-
-    if (!outBlob || !outBlobSize || !hmac || !encIdentity) return FALSE;
-    *outBlob = NULL;
-    *outBlobSize = 0;
-
-    if (hmacLen > 0xFFFFu || encIdentityLen > 0xFFFFu) return FALSE;
-
-    innerSize = 2u + (size_t)hmacLen + 2u + (size_t)encIdentityLen;
-    totalSize = 2u + innerSize;
-
-    if (innerSize > 0xFFFFu || totalSize > 0xFFFFu) return FALSE;
-    if (totalSize < 6u) return FALSE;
-
-    blob = (BYTE*)calloc(1, totalSize);
-    if (!blob) return FALSE;
-
-    if (!write_u16_be(blob, totalSize, 0, (USHORT)innerSize)) goto fail;
-    if (!write_u16_be(blob, totalSize, 2, (USHORT)hmacLen)) goto fail;
-    memcpy(blob + 4, hmac, hmacLen);
-
-    if (!write_u16_be(blob, totalSize, 4u + (size_t)hmacLen, (USHORT)encIdentityLen)) goto fail;
-    memcpy(blob + 6u + (size_t)hmacLen, encIdentity, encIdentityLen);
-
-    *outBlob = blob;
-    *outBlobSize = (DWORD)totalSize;
-    return TRUE;
-
-fail:
-    free(blob);
-    return FALSE;
-}
-
-static BOOL aes_cfb128_encrypt(const BYTE* key, DWORD keySize, const BYTE* plaintext, DWORD plaintextLen, BYTE* ciphertext) {
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_KEY_HANDLE hKey = NULL;
-    PBYTE pbKeyObject = NULL;
-    DWORD cbKeyObject = 0, cbRes = 0;
-    NTSTATUS status;
-    BOOL ok = FALSE;
-
-    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
-    if (status != STATUS_SUCCESS) return FALSE;
-
-    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (PBYTE)BCRYPT_CHAIN_MODE_ECB, sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
-    if (status != STATUS_SUCCESS) goto cleanup;
-
-    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbKeyObject, sizeof(cbKeyObject), &cbRes, 0);
-    if (status != STATUS_SUCCESS) goto cleanup;
-
-    pbKeyObject = (PBYTE)malloc(cbKeyObject);
-    if (!pbKeyObject) goto cleanup;
-
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, pbKeyObject, cbKeyObject, (PUCHAR)key, keySize, 0);
-    if (status != STATUS_SUCCESS) goto cleanup;
-
-    BYTE iv[16] = { 0 };
-    BYTE outBlock[16];
-    DWORD cbOut = 0;
-    DWORD bytesProcessed = 0;
-
-    while (bytesProcessed < plaintextLen) {
-        status = BCryptEncrypt(hKey, iv, 16, NULL, NULL, 0, outBlock, 16, &cbOut, 0);
-        if (status != STATUS_SUCCESS) goto cleanup;
-
-        DWORD toProcess = plaintextLen - bytesProcessed;
-        if (toProcess > 16) toProcess = 16;
-
-        for (DWORD i = 0; i < toProcess; ++i) {
-            ciphertext[bytesProcessed + i] = plaintext[bytesProcessed + i] ^ outBlock[i];
-            iv[i] = ciphertext[bytesProcessed + i];
+void load_certs_from_pcp_property_store(NCRYPT_PROV_HANDLE h_prov, LPCWSTR prop_name, HCERTSTORE h_store_to_add_to) {
+    HCERTSTORE h_pcp_store = NULL;
+    DWORD cb_store = sizeof(h_pcp_store);
+    SECURITY_STATUS s = NCryptGetProperty(h_prov, prop_name, (PBYTE)&h_pcp_store, sizeof(h_pcp_store), &cb_store, 0);
+    if (s == ERROR_SUCCESS && h_pcp_store) {
+        PCCERT_CONTEXT c = NULL;
+        DWORD loaded_count = 0;
+        while ((c = CertEnumCertificatesInStore(h_pcp_store, c)) != NULL) {
+            if (CertAddCertificateContextToStore(h_store_to_add_to, c, CERT_STORE_ADD_NEW, NULL)) {
+                loaded_count++;
+            }
         }
-
-        bytesProcessed += toProcess;
+        CertCloseStore(h_pcp_store, 0);
+        if (loaded_count > 0) {
+            wprintf(L"  Loaded %lu intermediate certificate(s) from PCP property: %s\n", loaded_count, prop_name);
+        }
     }
-
-    ok = TRUE;
-
-cleanup:
-    if (hKey) BCryptDestroyKey(hKey);
-    if (pbKeyObject) free(pbKeyObject);
-    if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
-    return ok;
 }
 
-BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert) {
-    BOOL ok = FALSE;
-    NCRYPT_PROV_HANDLE hProv = 0;
-    NCRYPT_KEY_HANDLE hAIK = 0;
-    SECURITY_STATUS s;
-    BYTE* rsaKeyBlob = NULL;
-    DWORD rsaKeyBlobSize = 0;
-    BCRYPT_ALG_HANDLE hRng = NULL;
-
-    BYTE* pbIdBinding = NULL;
-    DWORD cbIdBinding = 0;
-    BYTE* name = NULL;
-    DWORD cbName = 0;
-    BYTE* idObjectBytes = NULL;
-    DWORD idObjectSize = 0;
-    BYTE* encSecretBytes = NULL;
-    DWORD encSecretSize = 0;
-    BYTE* activationBlob = NULL;
-    DWORD activationBlobSize = 0;
-    BYTE* nonce = NULL;
-    BYTE* encNonce = NULL;
-    DWORD challengeLen = 0;
-    DWORD cbHashObject = 0;
-
-    printf("Executing Cryptographic Proof-of-Possession of Endorsement Key.\n");
-
-    if (BCryptOpenAlgorithmProvider(&hRng, BCRYPT_RNG_ALGORITHM, NULL, 0) == STATUS_SUCCESS) {
-        printf("  RNG: BCryptGenRandom available.\n");
-        BCryptCloseAlgorithmProvider(hRng, 0);
-        hRng = NULL;
-    }
-    else {
-        printf("  [!] BCrypt RNG provider unavailable; will fall back to rand().\n");
-    }
-
-    s = NCryptOpenStorageProvider(&hProv, MS_PLATFORM_CRYPTO_PROVIDER, 0);
-    if (s != ERROR_SUCCESS) {
-        print_ntstatus("NCryptOpenStorageProvider", s);
-        return FALSE;
-    }
-    printf("  Opened provider: %ws\n", MS_PLATFORM_CRYPTO_PROVIDER);
-
-    s = NCryptCreatePersistedKey(hProv, &hAIK, BCRYPT_RSA_ALGORITHM, L"PoPAttestationKey", 0, NCRYPT_OVERWRITE_KEY_FLAG);
+void load_pcp_intermediate_certs(HCERTSTORE store) {
+    NCRYPT_PROV_HANDLE h_prov = 0;
+    SECURITY_STATUS s = NCryptOpenStorageProvider(&h_prov, MS_PLATFORM_CRYPTO_PROVIDER, 0);
     if (s == ERROR_SUCCESS) {
-        DWORD dwUsagePolicy = NCRYPT_PCP_IDENTITY_KEY;
-        DWORD dwKeyBits = 2048;
-        SECURITY_STATUS s2;
-
-        s2 = NCryptSetProperty(hAIK, NCRYPT_LENGTH_PROPERTY, (PBYTE)&dwKeyBits, sizeof(dwKeyBits), 0);
-        if (s2 != ERROR_SUCCESS) {
-            print_ntstatus("NCryptSetProperty(NCRYPT_LENGTH_PROPERTY)", s2);
-        }
-
-        s2 = NCryptSetProperty(hAIK, L"PCP_KEY_USAGE_POLICY", (PBYTE)&dwUsagePolicy, sizeof(dwUsagePolicy), 0);
-        if (s2 != ERROR_SUCCESS) {
-            print_ntstatus("NCryptSetProperty(PCP_KEY_USAGE_POLICY)", s2);
-        }
-
-        s = NCryptFinalizeKey(hAIK, 0);
+        load_certs_from_pcp_property_store(h_prov, L"PCP_RSA_EKNVCERT", store);
+        load_certs_from_pcp_property_store(h_prov, L"PCP_ECC_EKNVCERT", store);
+        load_certs_from_pcp_property_store(h_prov, L"PCP_EKNVCERT", store);
+        load_certs_from_pcp_property_store(h_prov, L"PCP_INTERMEDIATE_CA_EKCERT", store);
+        NCryptFreeObject(h_prov);
     }
+}
 
-    if (s != ERROR_SUCCESS) {
-        print_ntstatus("NCryptCreatePersistedKey / NCryptFinalizeKey (AIK)", s);
-        NCryptFreeObject(hProv);
+BOOL build_candidate_issuer_store(HCERTSTORE h_cab_store, HCERTSTORE h_roots, HCERTSTORE h_ca_store, HCERTSTORE* out_store) {
+    HCERTSTORE h_store = NULL;
+    HCERTSTORE h_lm_roots = NULL;
+    HCERTSTORE h_lm_ca = NULL;
+    PCCERT_CONTEXT c = NULL;
+
+    if (!out_store) return FALSE;
+    *out_store = NULL;
+
+    h_store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    if (!h_store) {
         return FALSE;
     }
 
-    if (!export_cert_public_key_blob(ekCert, &rsaKeyBlob, &rsaKeyBlobSize)) {
-        printf("  Failed to export validated EK public key from certificate.\n");
-        NCryptDeleteKey(hAIK, 0);
-        NCryptFreeObject(hProv);
-        return FALSE;
-    }
-
-    printf("  EK public key blob size: %lu bytes\n", (unsigned long)rsaKeyBlobSize);
-
-    if (!read_ncrypt_property_bytes(hAIK, L"PCP_TPM12_IDBINDING", &pbIdBinding, &cbIdBinding)) {
-        printf("  Failed to read AIK binding.\n");
-        free(rsaKeyBlob);
-        NCryptDeleteKey(hAIK, 0);
-        NCryptFreeObject(hProv);
-        return FALSE;
-    }
-
-    dump_hex_prefix("  AIK binding", pbIdBinding, cbIdBinding, 64);
-
-    if (!compute_tpm_name_from_binding(pbIdBinding, cbIdBinding, &name, &cbName)) {
-        printf("  Failed to compute TPM Name from AIK binding.\n");
-        free(pbIdBinding);
-        free(rsaKeyBlob);
-        NCryptDeleteKey(hAIK, 0);
-        NCryptFreeObject(hProv);
-        return FALSE;
-    }
-
-    {
-        USHORT nameAlg = 0;
-        if (cbIdBinding >= 2 + 4) {
-            DWORD publicSize = ((DWORD)pbIdBinding[0] << 8) | pbIdBinding[1];
-            if (cbIdBinding >= 2 + publicSize && publicSize >= 4) {
-                BYTE* pbRawPublic = (BYTE*)(pbIdBinding + 2);
-                nameAlg = (USHORT)(((USHORT)pbRawPublic[2] << 8) | pbRawPublic[3]);
-            }
-        }
-
-        if (cbName < 3) {
-            printf("  [-] AIK Name blob is too small.\n");
-            free(pbIdBinding);
-            free(rsaKeyBlob);
-            free(name);
-            NCryptDeleteKey(hAIK, 0);
-            NCryptFreeObject(hProv);
-            return FALSE;
-        }
-
-        challengeLen = cbName - 2;
-        printf("  AIK nameAlg: 0x%04X\n", nameAlg);
-        printf("  AIK Name size: %lu bytes\n", (unsigned long)cbName);
-        printf("  Credential / POP nonce size: %lu bytes\n", (unsigned long)challengeLen);
-
-        if (challengeLen != 32) {
-            printf("  [!] This TPM Name digest size is not 32 bytes. The attestation profile usually expects the nonce to match the Name hash size.\n");
+    if (h_cab_store) {
+        while ((c = CertEnumCertificatesInStore(h_cab_store, c)) != NULL) {
+            CertAddCertificateContextToStore(h_store, c, CERT_STORE_ADD_ALWAYS, NULL);
         }
     }
 
-    free(pbIdBinding);
-    pbIdBinding = NULL;
-
-    nonce = (BYTE*)malloc(challengeLen);
-    encNonce = (BYTE*)malloc(challengeLen);
-    if (!nonce || !encNonce) {
-        printf("  [-] Out of memory allocating challenge buffers.\n");
-        free(nonce);
-        free(encNonce);
-        free(rsaKeyBlob);
-        free(name);
-        NCryptDeleteKey(hAIK, 0);
-        NCryptFreeObject(hProv);
-        return FALSE;
+    c = NULL;
+    if (h_roots) {
+        while ((c = CertEnumCertificatesInStore(h_roots, c)) != NULL) {
+            CertAddCertificateContextToStore(h_store, c, CERT_STORE_ADD_ALWAYS, NULL);
+        }
     }
 
-    {
-        BCRYPT_ALG_HANDLE hSeedRng = NULL;
-        if (BCryptOpenAlgorithmProvider(&hSeedRng, BCRYPT_RNG_ALGORITHM, NULL, 0) == STATUS_SUCCESS) {
-            if (BCryptGenRandom(hSeedRng, nonce, challengeLen, 0) != STATUS_SUCCESS) {
-                printf("  [!] BCryptGenRandom failed; falling back to rand().\n");
-                for (DWORD i = 0; i < challengeLen; ++i) nonce[i] = (BYTE)(rand() & 0xFF);
-            }
-            BCryptCloseAlgorithmProvider(hSeedRng, 0);
+    c = NULL;
+    if (h_ca_store) {
+        while ((c = CertEnumCertificatesInStore(h_ca_store, c)) != NULL) {
+            CertAddCertificateContextToStore(h_store, c, CERT_STORE_ADD_ALWAYS, NULL);
         }
-        else {
-            printf("  [!] RNG provider unavailable for challenge; falling back to rand().\n");
-            for (DWORD i = 0; i < challengeLen; ++i) nonce[i] = (BYTE)(rand() & 0xFF);
+    }
+
+    h_lm_roots = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
+        "ROOT");
+    if (h_lm_roots) {
+        c = NULL;
+        while ((c = CertEnumCertificatesInStore(h_lm_roots, c)) != NULL) {
+            CertAddCertificateContextToStore(h_store, c, CERT_STORE_ADD_ALWAYS, NULL);
+        }
+    }
+
+    h_lm_ca = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
+        "CA");
+    if (h_lm_ca) {
+        c = NULL;
+        while ((c = CertEnumCertificatesInStore(h_lm_ca, c)) != NULL) {
+            CertAddCertificateContextToStore(h_store, c, CERT_STORE_ADD_ALWAYS, NULL);
         }
     }
 
     {
-        BCRYPT_ALG_HANDLE hRsaAlg = NULL;
-        BCRYPT_KEY_HANDLE hRsaKey = NULL;
-        NTSTATUS status;
-
-        status = BCryptOpenAlgorithmProvider(&hRsaAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
-        if (status != STATUS_SUCCESS) {
-            printf("  [-] BCryptOpenAlgorithmProvider(RSA) failed: 0x%08X\n", status);
-            goto cleanup;
-        }
-
-        status = BCryptImportKeyPair(hRsaAlg, NULL, BCRYPT_RSAPUBLIC_BLOB, &hRsaKey, rsaKeyBlob, rsaKeyBlobSize, 0);
-        if (status != STATUS_SUCCESS) {
-            printf("  [-] BCryptImportKeyPair failed: 0x%08X\n", status);
-            goto cleanup_rsa;
-        }
-
-        DWORD seedSize = 32;
-        BYTE* seed = (BYTE*)malloc(seedSize);
-        if (!seed) {
-            printf("  [-] Out of memory allocating seed.\n");
-            goto cleanup_rsa;
-        }
-
-        if (BCryptOpenAlgorithmProvider(&hRng, BCRYPT_RNG_ALGORITHM, NULL, 0) == STATUS_SUCCESS) {
-            if (BCryptGenRandom(hRng, seed, seedSize, 0) != STATUS_SUCCESS) {
-                printf("  [!] BCryptGenRandom(seed) failed; using rand().\n");
-                for (size_t i = 0; i < seedSize; ++i) seed[i] = (BYTE)(rand() & 0xFF);
+        HCERTSTORE h_ent_root = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
+            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
+            "Enterprise Root");
+        if (h_ent_root) {
+            c = NULL;
+            while ((c = CertEnumCertificatesInStore(h_ent_root, c)) != NULL) {
+                CertAddCertificateContextToStore(h_store, c, CERT_STORE_ADD_ALWAYS, NULL);
             }
-            BCryptCloseAlgorithmProvider(hRng, 0);
-            hRng = NULL;
+            CertCloseStore(h_ent_root, 0);
         }
-        else {
-            for (size_t i = 0; i < seedSize; ++i) seed[i] = (BYTE)(rand() & 0xFF);
-        }
-
-        BCRYPT_OAEP_PADDING_INFO oaepInfo;
-        ZeroMemory(&oaepInfo, sizeof(oaepInfo));
-        oaepInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
-        oaepInfo.pbLabel = (PUCHAR)"IDENTITY";
-        oaepInfo.cbLabel = 8; 
-
-        DWORD encSecretAlloc = 0;
-        status = BCryptEncrypt(hRsaKey, seed, seedSize, &oaepInfo, NULL, 0, NULL, 0, &encSecretAlloc, BCRYPT_PAD_OAEP);
-        if (status != STATUS_SUCCESS || encSecretAlloc == 0) {
-            printf("  [-] BCryptEncrypt(RSA size query) failed: 0x%08X\n", status);
-            free(seed);
-            goto cleanup_rsa;
-        }
-
-        BYTE* rawEnc = (BYTE*)malloc(encSecretAlloc);
-        if (!rawEnc) {
-            printf("  [-] Out of memory allocating wrapped seed buffer.\n");
-            free(seed);
-            goto cleanup_rsa;
-        }
-
-        DWORD encOut = 0;
-        status = BCryptEncrypt(hRsaKey, seed, seedSize, &oaepInfo, NULL, 0, rawEnc, encSecretAlloc, &encOut, BCRYPT_PAD_OAEP);
-        if (status != STATUS_SUCCESS) {
-            printf("  [-] BCryptEncrypt(RSA seed encryption) failed: 0x%08X\n", status);
-            free(rawEnc);
-            free(seed);
-            goto cleanup_rsa;
-        }
-
-        encSecretSize = 2 + encOut;
-        encSecretBytes = (BYTE*)malloc(encSecretSize);
-        if (!encSecretBytes) {
-            printf("  [-] Out of memory allocating EK-wrapped seed.\n");
-            free(rawEnc);
-            free(seed);
-            goto cleanup_rsa;
-        }
-
-        encSecretBytes[0] = (BYTE)((encOut >> 8) & 0xFF);
-        encSecretBytes[1] = (BYTE)(encOut & 0xFF);
-        memcpy(encSecretBytes + 2, rawEnc, encOut);
-        dump_hex_prefix("  EK-wrapped seed", encSecretBytes, encSecretSize, 64);
-
-        free(rawEnc);
-
-        {
-            BYTE symKey[16];
-            BYTE hmacKey[32];
-
-            if (!KDFa_Generic(0x000B, seed, seedSize, "STORAGE", name, cbName, 128, symKey)) {
-                printf("  [-] KDFa(STORAGE) failed.\n");
-                free(seed);
-                goto cleanup_rsa;
-            }
-
-            if (!KDFa_Generic(0x000B, seed, seedSize, "INTEGRITY", NULL, 0, 256, hmacKey)) {
-                printf("  [-] KDFa(INTEGRITY) failed.\n");
-                free(seed);
-                goto cleanup_rsa;
-            }
-
-            dump_hex_prefix("  Derived STORAGE key", symKey, sizeof(symKey), 32);
-            dump_hex_prefix("  Derived INTEGRITY key", hmacKey, sizeof(hmacKey), 32);
-
-            if (!aes_cfb128_encrypt(symKey, sizeof(symKey), nonce, challengeLen, encNonce)) {
-                printf("  [-] AES_CFB128_Encrypt failed.\n");
-                free(seed);
-                goto cleanup_rsa;
-            }
-
-            dump_hex_prefix("  Encrypted identity", encNonce, challengeLen, 64);
-
-            {
-                BCRYPT_ALG_HANDLE hHmacAlg = NULL;
-                BCRYPT_HASH_HANDLE hHmac = NULL;
-                BYTE hmacOut[32];
-                DWORD cbRes = 0;
-
-                status = BCryptOpenAlgorithmProvider(&hHmacAlg, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-                if (status != STATUS_SUCCESS) {
-                    printf("  [-] BCryptOpenAlgorithmProvider(HMAC) failed: 0x%08X\n", status);
-                    free(seed);
-                    goto cleanup_rsa;
-                }
-
-                status = BCryptGetProperty(hHmacAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbHashObject, sizeof(cbHashObject), &cbRes, 0);
-                if (status != STATUS_SUCCESS || cbHashObject == 0) {
-                    printf("  [-] BCryptGetProperty(HMAC Object length) failed: 0x%08X\n", status);
-                    BCryptCloseAlgorithmProvider(hHmacAlg, 0);
-                    free(seed);
-                    goto cleanup_rsa;
-                }
-
-                PBYTE pbHashObject = (PBYTE)malloc(cbHashObject);
-                if (!pbHashObject) {
-                    printf("  [-] Out of memory allocating HMAC hash object.\n");
-                    BCryptCloseAlgorithmProvider(hHmacAlg, 0);
-                    free(seed);
-                    goto cleanup_rsa;
-                }
-
-                status = BCryptCreateHash(hHmacAlg, &hHmac, pbHashObject, cbHashObject, hmacKey, sizeof(hmacKey), 0);
-                if (status != STATUS_SUCCESS) {
-                    printf("  [-] BCryptCreateHash failed: 0x%08X\n", status);
-                    free(pbHashObject);
-                    BCryptCloseAlgorithmProvider(hHmacAlg, 0);
-                    free(seed);
-                    goto cleanup_rsa;
-                }
-
-                if (BCryptHashData(hHmac, encNonce, challengeLen, 0) != STATUS_SUCCESS ||
-                    BCryptHashData(hHmac, name, cbName, 0) != STATUS_SUCCESS ||
-                    BCryptFinishHash(hHmac, hmacOut, sizeof(hmacOut), 0) != STATUS_SUCCESS) {
-                    printf("  [-] HMAC computation failed.\n");
-                    BCryptDestroyHash(hHmac);
-                    free(pbHashObject);
-                    BCryptCloseAlgorithmProvider(hHmacAlg, 0);
-                    free(seed);
-                    goto cleanup_rsa;
-                }
-
-                BCryptDestroyHash(hHmac);
-                free(pbHashObject);
-                BCryptCloseAlgorithmProvider(hHmacAlg, 0);
-
-                if (!build_tpm2b_id_object(hmacOut, sizeof(hmacOut), encNonce, challengeLen, &idObjectBytes, &idObjectSize)) {
-                    printf("  [-] build_tpm2b_id_object failed.\n");
-                    free(seed);
-                    goto cleanup_rsa;
-                }
-
-                dump_hex_prefix("  ID object", idObjectBytes, idObjectSize, 96);
-
-                activationBlobSize = idObjectSize + encSecretSize;
-                activationBlob = (BYTE*)malloc(activationBlobSize);
-                if (!activationBlob) {
-                    printf("  [-] Out of memory allocating activation blob.\n");
-                    free(seed);
-                    goto cleanup_rsa;
-                }
-
-                memcpy(activationBlob, idObjectBytes, idObjectSize);
-                memcpy(activationBlob + idObjectSize, encSecretBytes, encSecretSize);
-                dump_hex_prefix("  Activation blob", activationBlob, activationBlobSize, 128);
-
-                printf("  [DEBUG] Setting PCP_TPM12_IDACTIVATION on AIK handle.\n");
-                s = NCryptSetProperty(hAIK,
-                    NCRYPT_PCP_TPM12_IDACTIVATION_PROPERTY,
-                    activationBlob,
-                    activationBlobSize,
-                    0);
-                if (s != ERROR_SUCCESS) {
-                    print_ntstatus("  [-] NCryptSetProperty(PCP_TPM12_IDACTIVATION)", s);
-                    printf("  [DEBUG] The provider rejected the blob before any returned credential existed.\n");
-                    goto cleanup_rsa;
-                }
-
-                {
-                    DWORD cbUnwrapped = 0;
-                    printf("  [DEBUG] Querying returned credential size via PCP_TPM12_IDACTIVATION.\n");
-                    s = NCryptGetProperty(hAIK,
-                        NCRYPT_PCP_TPM12_IDACTIVATION_PROPERTY,
-                        NULL,
-                        0,
-                        &cbUnwrapped,
-                        0);
-                    printf("  [DEBUG] NCryptGetProperty(size) status=0x%08X size=%lu\n",
-                        s, (unsigned long)cbUnwrapped);
-
-                    if (s == TPM_20_E_VALUE || s == 0x80280084) {
-                        printf("  [DEBUG] PCP_TPM12_IDACTIVATION route is unsupported for TPM 2.0 activation.\n");
-                        goto cleanup_rsa;
-                    }
-
-                    if (s != NTE_BUFFER_TOO_SMALL && s != ERROR_SUCCESS) {
-                        print_ntstatus("  [-] NCryptGetProperty(PCP_TPM12_IDACTIVATION) - Size query failed", s);
-                        goto cleanup_rsa;
-                    }
-
-                    BYTE* unwrapped = (BYTE*)malloc(cbUnwrapped ? cbUnwrapped : 1);
-                    if (!unwrapped) {
-                        printf("  [-] Out of memory allocating returned credential buffer.\n");
-                        goto cleanup_rsa;
-                    }
-
-                    s = NCryptGetProperty(hAIK,
-                        NCRYPT_PCP_TPM12_IDACTIVATION_PROPERTY,
-                        unwrapped,
-                        cbUnwrapped,
-                        &cbUnwrapped,
-                        0);
-                    if (s == ERROR_SUCCESS) {
-                        dump_hex_prefix("  Returned credential", unwrapped, cbUnwrapped, 64);
-
-                        if (cbUnwrapped == challengeLen &&
-                            memcmp(unwrapped, nonce, challengeLen) == 0) {
-                            printf("  [SUCCESS] Local TPM decrypted the challenge. Possession of the verified EK private key is validated.\n");
-                            ok = TRUE;
-                        }
-                        else {
-                            printf("  [-] Decrypted credential mismatch. Expected %lu bytes.\n",
-                                (unsigned long)challengeLen);
-                        }
-                    }
-                    else {
-                        print_ntstatus("  [-] NCryptGetProperty(PCP_TPM12_IDACTIVATION) - Decryption denied", s);
-                        printf("  [DEBUG] Provider accepted SetProperty but refused to return any credential.\n");
-                    }
-
-                    free(unwrapped);
-                }
-
-                free(activationBlob);
-                activationBlob = NULL;
-            }
-        }
-
-        free(seed);
-
-    cleanup_rsa:
-        if (hRsaKey) BCryptDestroyKey(hRsaKey);
-        if (hRsaAlg) BCryptCloseAlgorithmProvider(hRsaAlg, 0);
     }
 
-cleanup:
-    free(pbIdBinding);
-    free(rsaKeyBlob);
-    free(encSecretBytes);
-    free(idObjectBytes);
-    free(name);
-    free(nonce);
-    free(encNonce);
+    load_tpm_intermediate_certs_from_registry(h_store);
+    load_pcp_intermediate_certs(h_store);
 
-    if (hAIK) NCryptDeleteKey(hAIK, 0);
-    if (hProv) NCryptFreeObject(hProv);
+    if (h_lm_roots) CertCloseStore(h_lm_roots, 0);
+    if (h_lm_ca) CertCloseStore(h_lm_ca, 0);
 
-    return ok;
+    *out_store = h_store;
+    return TRUE;
 }

@@ -146,6 +146,7 @@ BOOL cert_signature_validates_against_issuer(PCCERT_CONTEXT subject, PCCERT_CONT
 BOOL blob_equals(const CRYPT_DATA_BLOB* a, const CRYPT_DATA_BLOB* b);
 BOOL get_cert_subject_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out);
 BOOL get_cert_authority_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out);
+BOOL get_tpm_info_via_ncrypt(TPMINFO* info);
 PCCERT_CONTEXT find_valid_issuer_in_store(HCERTSTORE store, PCCERT_CONTEXT subject);
 
 void free_wstringlist(WSTRINGLIST* list);
