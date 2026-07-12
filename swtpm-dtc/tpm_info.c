@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <ncrypt.h>
+#include <bcrypt.h>
 #include <strsafe.h>
 #include <tbs.h>
 #include <time.h>
@@ -25,11 +26,14 @@
 #define TPM_CC_FlushContext        0x00000165
 #define TPM_CC_ReadPublic          0x00000173
 #define TPM_CC_GetCapability       0x0000017A
+#define TPM_CC_NV_ReadPublic       0x00000169
+#define TPM_CC_NV_Read             0x0000014E
 
 #define TPM_ALG_RSA                0x0001
 #define TPM_ALG_SHA256             0x000B
 #define TPM_ALG_NULL               0x0010
 #define TPM_ALG_RSASSA             0x0014
+#define TPM_ALG_ECC                0x0023
 
 #define TPM_SE_POLICY              0x01
 
@@ -208,6 +212,435 @@ static BOOL tpm_read_public(TBS_HCONTEXT h_tbs_context, UINT32 handle, BYTE* out
 
     *out_name_size = read_2b(&p, out_name, 128);
     return (*out_name_size > 0);
+}
+
+static BOOL tpm_read_public_area(TBS_HCONTEXT h_tbs_context, UINT32 handle, BYTE** out_public, DWORD* out_public_size) {
+    if (!out_public || !out_public_size) return FALSE;
+    *out_public = NULL;
+    *out_public_size = 0;
+
+    BYTE cmd[128];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_NO_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_ReadPublic);
+    write_32(&b, handle);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p);
+    read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        return FALSE;
+    }
+
+    UINT32 public_area_start_offset = p.read_pos;
+    UINT16 public_size = read_16(&p);
+    if (public_size == 0 || p.read_pos + public_size > resp_size) {
+        return FALSE;
+    }
+
+    DWORD total_tpm2b_public_size = 2 + public_size;
+    BYTE* buf = (BYTE*)malloc(total_tpm2b_public_size);
+    if (!buf) return FALSE;
+
+    memcpy(buf, resp + public_area_start_offset, total_tpm2b_public_size);
+    *out_public = buf;
+    *out_public_size = total_tpm2b_public_size;
+    return TRUE;
+}
+
+static BOOL parse_tpm2b_public_rsa(const BYTE* tpm2b, DWORD tpm2b_size, UINT32* out_exponent, BYTE** out_modulus, UINT16* out_modulus_size) {
+    if (!tpm2b || tpm2b_size < 12) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, tpm2b, tpm2b_size);
+
+    UINT16 size = read_16(&p);
+    if (size == 0 || p.read_pos + size > tpm2b_size) return FALSE;
+
+    UINT16 type = read_16(&p);
+    if (type != TPM_ALG_RSA) return FALSE;
+
+    read_16(&p);
+    read_32(&p);
+
+    UINT16 auth_policy_size = read_16(&p);
+    p.read_pos += auth_policy_size;
+
+    UINT16 sym_alg = read_16(&p);
+    if (sym_alg != 0x0010) {
+        read_16(&p);
+        read_16(&p);
+    }
+
+    UINT16 scheme_alg = read_16(&p);
+    if (scheme_alg != 0x0010) {
+        read_16(&p);
+    }
+
+    UINT16 key_bits = read_16(&p);
+    UINT32 exponent = read_32(&p);
+    if (exponent == 0) {
+        exponent = 65537;
+    }
+
+    UINT16 modulus_size = read_16(&p);
+    if (modulus_size == 0 || p.read_pos + modulus_size > tpm2b_size) return FALSE;
+
+    BYTE* modulus = (BYTE*)malloc(modulus_size);
+    if (!modulus) return FALSE;
+
+    read_buf(&p, modulus, modulus_size);
+
+    *out_exponent = exponent;
+    *out_modulus = modulus;
+    *out_modulus_size = modulus_size;
+    return TRUE;
+}
+
+static BOOL parse_tpm2b_public_ecc(const BYTE* tpm2b, DWORD tpm2b_size, UINT16* out_curve_id, BYTE** out_x, UINT16* out_x_size, BYTE** out_y, UINT16* out_y_size) {
+    if (!tpm2b || tpm2b_size < 12) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, tpm2b, tpm2b_size);
+
+    UINT16 size = read_16(&p);
+    if (size == 0 || p.read_pos + size > tpm2b_size) return FALSE;
+
+    UINT16 type = read_16(&p);
+    if (type != TPM_ALG_ECC) return FALSE;
+
+    read_16(&p);
+    read_32(&p);
+
+    UINT16 auth_policy_size = read_16(&p);
+    p.read_pos += auth_policy_size;
+
+    UINT16 sym_alg = read_16(&p);
+    if (sym_alg != 0x0010) {
+        read_16(&p);
+        read_16(&p);
+    }
+
+    UINT16 scheme_alg = read_16(&p);
+    if (scheme_alg != 0x0010) {
+        read_16(&p);
+    }
+
+    UINT16 curve_id = read_16(&p);
+
+    UINT16 kdf_alg = read_16(&p);
+    if (kdf_alg != 0x0010) {
+        read_16(&p);
+    }
+
+    UINT16 x_size = read_16(&p);
+    if (x_size == 0 || p.read_pos + x_size > tpm2b_size) return FALSE;
+    BYTE* x = (BYTE*)malloc(x_size);
+    if (!x) return FALSE;
+    read_buf(&p, x, x_size);
+
+    UINT16 y_size = read_16(&p);
+    if (y_size == 0 || p.read_pos + y_size > tpm2b_size) {
+        free(x);
+        return FALSE;
+    }
+    BYTE* y = (BYTE*)malloc(y_size);
+    if (!y) {
+        free(x);
+        return FALSE;
+    }
+    read_buf(&p, y, y_size);
+
+    *out_curve_id = curve_id;
+    *out_x = x;
+    *out_x_size = x_size;
+    *out_y = y;
+    *out_y_size = y_size;
+    return TRUE;
+}
+
+static BYTE* rsa_to_bcrypt_blob(UINT32 exponent, const BYTE* modulus, UINT16 modulus_size, DWORD* out_blob_size) {
+    BYTE exp_bytes[4];
+    exp_bytes[0] = (exponent >> 24) & 0xFF;
+    exp_bytes[1] = (exponent >> 16) & 0xFF;
+    exp_bytes[2] = (exponent >> 8) & 0xFF;
+    exp_bytes[3] = exponent & 0xFF;
+
+    DWORD exp_start = 0;
+    while (exp_start < 3 && exp_bytes[exp_start] == 0) {
+        exp_start++;
+    }
+    DWORD exp_len = 4 - exp_start;
+
+    DWORD total_size = sizeof(BCRYPT_RSAKEY_BLOB) + exp_len + modulus_size;
+    BYTE* blob = (BYTE*)malloc(total_size);
+    if (!blob) return NULL;
+
+    BCRYPT_RSAKEY_BLOB* header = (BCRYPT_RSAKEY_BLOB*)blob;
+    header->Magic = BCRYPT_RSAPUBLIC_MAGIC;
+    header->BitLength = modulus_size * 8;
+    header->cbPublicExp = exp_len;
+    header->cbModulus = modulus_size;
+    header->cbPrime1 = 0;
+    header->cbPrime2 = 0;
+
+    BYTE* dest = blob + sizeof(BCRYPT_RSAKEY_BLOB);
+    memcpy(dest, exp_bytes + exp_start, exp_len);
+    dest += exp_len;
+    memcpy(dest, modulus, modulus_size);
+
+    *out_blob_size = total_size;
+    return blob;
+}
+
+static BYTE* ecc_to_bcrypt_blob(UINT16 curve_id, const BYTE* x, UINT16 x_size, const BYTE* y, UINT16 y_size, DWORD* out_blob_size) {
+    DWORD magic = 0;
+    if (curve_id == 0x0003) {
+        magic = BCRYPT_ECDH_PUBLIC_P256_MAGIC;
+    }
+    else if (curve_id == 0x0004) {
+        magic = BCRYPT_ECDH_PUBLIC_P384_MAGIC;
+    }
+    else {
+        return NULL;
+    }
+
+    DWORD total_size = sizeof(BCRYPT_ECCKEY_BLOB) + x_size + y_size;
+    BYTE* blob = (BYTE*)malloc(total_size);
+    if (!blob) return NULL;
+
+    BCRYPT_ECCKEY_BLOB* header = (BCRYPT_ECCKEY_BLOB*)blob;
+    header->dwMagic = magic;
+    header->cbKey = x_size;
+
+    BYTE* dest = blob + sizeof(BCRYPT_ECCKEY_BLOB);
+    memcpy(dest, x, x_size);
+    dest += x_size;
+    memcpy(dest, y, y_size);
+
+    *out_blob_size = total_size;
+    return blob;
+}
+
+static BYTE* tpm_public_to_bcrypt_blob(const BYTE* tpm2b, DWORD tpm2b_size, DWORD* out_blob_size) {
+    if (!tpm2b || tpm2b_size < 6) return NULL;
+
+    UINT16 type = (tpm2b[2] << 8) | tpm2b[3];
+    if (type == TPM_ALG_RSA) {
+        UINT32 exponent = 0;
+        BYTE* modulus = NULL;
+        UINT16 modulus_size = 0;
+        if (parse_tpm2b_public_rsa(tpm2b, tpm2b_size, &exponent, &modulus, &modulus_size)) {
+            BYTE* blob = rsa_to_bcrypt_blob(exponent, modulus, modulus_size, out_blob_size);
+            free(modulus);
+            return blob;
+        }
+    }
+    else if (type == TPM_ALG_ECC) {
+        UINT16 curve_id = 0;
+        BYTE* x = NULL;
+        UINT16 x_size = 0;
+        BYTE* y = NULL;
+        UINT16 y_size = 0;
+        if (parse_tpm2b_public_ecc(tpm2b, tpm2b_size, &curve_id, &x, &x_size, &y, &y_size)) {
+            BYTE* blob = ecc_to_bcrypt_blob(curve_id, x, x_size, y, y_size, out_blob_size);
+            free(x);
+            free(y);
+            return blob;
+        }
+    }
+    return NULL;
+}
+
+static BOOL tpm_nv_read_public(TBS_HCONTEXT h_tbs_context, UINT32 nv_index, UINT16* out_data_size) {
+    BYTE cmd[128];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_NO_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_NV_ReadPublic);
+    write_32(&b, nv_index);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p);
+    read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        return FALSE;
+    }
+
+    UINT16 total_nv_pub_size = read_16(&p);
+    if (total_nv_pub_size == 0) return FALSE;
+
+    read_32(&p);
+    read_16(&p);
+    read_32(&p);
+
+    UINT16 auth_policy_size = read_16(&p);
+    p.read_pos += auth_policy_size;
+
+    *out_data_size = read_16(&p);
+    return TRUE;
+}
+
+static BOOL tpm_nv_read(TBS_HCONTEXT h_tbs_context, UINT32 auth_handle, UINT32 nv_index, UINT16 size, UINT16 offset, BYTE* out_data, UINT16* out_size) {
+    BYTE cmd[256];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_NV_Read);
+    write_32(&b, auth_handle);
+    write_32(&b, nv_index);
+
+    write_32(&b, 9);
+    write_32(&b, TPM_RS_PW);
+    write_16(&b, 0);
+    write_8(&b, 0);
+    write_16(&b, 0);
+
+    write_16(&b, size);
+    write_16(&b, offset);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[2048];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    UINT16 tag = read_16(&p);
+    read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        return FALSE;
+    }
+
+    if (tag == TPM_ST_SESSIONS) {
+        read_32(&p);
+    }
+
+    *out_size = read_2b(&p, out_data, size);
+    return (*out_size > 0);
+}
+
+static BYTE* tpm_read_full_nv_index(TBS_HCONTEXT h_tbs_context, UINT32 auth_handle, UINT32 nv_index, DWORD* out_total_size) {
+    UINT16 data_size = 0;
+    if (!tpm_nv_read_public(h_tbs_context, nv_index, &data_size)) {
+        return NULL;
+    }
+    if (data_size == 0 || data_size > 8192) {
+        return NULL;
+    }
+
+    BYTE* cert_buf = (BYTE*)malloc(data_size);
+    if (!cert_buf) return NULL;
+
+    UINT16 bytes_read = 0;
+    UINT16 chunk_size = 256;
+
+    while (bytes_read < data_size) {
+        UINT16 to_read = data_size - bytes_read;
+        if (to_read > chunk_size) {
+            to_read = chunk_size;
+        }
+
+        BYTE chunk[256];
+        UINT16 read_len = 0;
+        if (!tpm_nv_read(h_tbs_context, auth_handle, nv_index, to_read, bytes_read, chunk, &read_len)) {
+            if (auth_handle == TPM_RH_OWNER) {
+                if (tpm_nv_read(h_tbs_context, TPM_RH_ENDORSEMENT, nv_index, to_read, bytes_read, chunk, &read_len)) {
+                    goto chunk_ok;
+                }
+            }
+            free(cert_buf);
+            return NULL;
+        }
+
+    chunk_ok:
+        if (read_len == 0) {
+            free(cert_buf);
+            return NULL;
+        }
+        memcpy(cert_buf + bytes_read, chunk, read_len);
+        bytes_read += read_len;
+    }
+
+    *out_total_size = data_size;
+    return cert_buf;
+}
+
+BOOL get_ek_cert_store_directly(HCERTSTORE* out_store) {
+    if (!out_store) return FALSE;
+    *out_store = NULL;
+
+    HCERTSTORE h_store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    if (!h_store) return FALSE;
+
+    TBS_CONTEXT_PARAMS2 params;
+    params.version = TBS_CONTEXT_VERSION_TWO;
+    params.includeTpm12 = 0;
+    params.includeTpm20 = 1;
+    TBS_HCONTEXT h_tbs_context = 0;
+
+    TBS_RESULT tr = Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &h_tbs_context);
+    if (tr != TBS_SUCCESS) {
+        CertCloseStore(h_store, 0);
+        return FALSE;
+    }
+
+    UINT32 indices[] = { 0x01c00002, 0x01c0000a };
+    BOOL found = FALSE;
+
+    for (int i = 0; i < 2; i++) {
+        DWORD cert_size = 0;
+        BYTE* cert_bytes = tpm_read_full_nv_index(h_tbs_context, TPM_RH_OWNER, indices[i], &cert_size);
+        if (!cert_bytes) {
+            cert_bytes = tpm_read_full_nv_index(h_tbs_context, TPM_RH_ENDORSEMENT, indices[i], &cert_size);
+        }
+
+        if (cert_bytes) {
+            PCCERT_CONTEXT ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, cert_bytes, cert_size);
+            if (ctx) {
+                if (CertAddCertificateContextToStore(h_store, ctx, CERT_STORE_ADD_ALWAYS, NULL)) {
+                    found = TRUE;
+                }
+                CertFreeCertificateContext(ctx);
+            }
+            free(cert_bytes);
+        }
+    }
+
+    Tbsip_Context_Close(h_tbs_context);
+
+    if (!found) {
+        CertCloseStore(h_store, 0);
+        return FALSE;
+    }
+
+    *out_store = h_store;
+    return TRUE;
 }
 
 static BOOL tpm_create_primary_ak(TBS_HCONTEXT h_tbs_context, UINT32* out_ak_handle) {
@@ -541,7 +974,10 @@ static BOOL execute_possession_challenge(TBS_HCONTEXT h_tbs_context, UINT32 ek_h
 }
 
 BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ek_cert) {
-    UNREFERENCED_PARAMETER(ek_cert);
+    if (!ek_cert) {
+        printf("[!] Error: No validated EK certificate provided for challenge binding.\n");
+        return FALSE;
+    }
 
     TBS_CONTEXT_PARAMS2 params;
     params.version = TBS_CONTEXT_VERSION_TWO;
@@ -564,20 +1000,34 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ek_cert) {
     if (tpm_enumerate_persistent_handles(h_tbs_context, handles, &handle_count)) {
         for (UINT32 i = 0; i < handle_count; i++) {
             if (handles[i] >= 0x81010000 && handles[i] <= 0x810100FF) {
-                preinstalled_ek_handle = handles[i];
-                break;
+                BYTE* ek_pub_tpm2b = NULL;
+                DWORD ek_pub_tpm2b_size = 0;
+                if (tpm_read_public_area(h_tbs_context, handles[i], &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
+                    DWORD bcrypt_blob_size = 0;
+                    BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
+                    if (bcrypt_blob) {
+                        if (ekpub_matches_cert(ek_cert, bcrypt_blob, bcrypt_blob_size)) {
+                            preinstalled_ek_handle = handles[i];
+                            free(bcrypt_blob);
+                            free(ek_pub_tpm2b);
+                            break;
+                        }
+                        free(bcrypt_blob);
+                    }
+                    free(ek_pub_tpm2b);
+                }
             }
         }
     }
 
     if (preinstalled_ek_handle == 0) {
-        printf("[!] Error: No preinstalled persistent EK detected.\n");
+        printf("[!] Error: No persistent EK handle matching the validated EK certificate was found. The TPM is not trusted.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
-    printf("[+] Preinstalled EK handle located: 0x%08X\n", preinstalled_ek_handle);
+    printf("[+] Target EK handle located: 0x%08X\n", preinstalled_ek_handle);
 
-    printf("[*] Loading transient AK under Owner hierarchy...\n");
+    printf("[*] Loading transient AK into your TPM under Owner hierarchy...\n");
     UINT32 ak_handle = 0;
     if (!tpm_create_primary_ak(h_tbs_context, &ak_handle)) {
         printf("[!] Failed to load transient AK.\n");
@@ -756,12 +1206,55 @@ BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
 
     parse_platform_type_string(info);
 
-    if (!read_ncrypt_property_bytes(h_prov, NCRYPT_PCP_EKPUB_PROPERTY, &info->ekPub, &info->ekPubSize)) {
-        info->ekPub = NULL;
-        info->ekPubSize = 0;
+    info->ekPub = NULL;
+    info->ekPubSize = 0;
+
+    TBS_CONTEXT_PARAMS2 params;
+    params.version = TBS_CONTEXT_VERSION_TWO;
+    params.includeTpm12 = 0;
+    params.includeTpm20 = 1;
+    TBS_HCONTEXT h_tbs_context = 0;
+    BOOL direct_success = FALSE;
+
+    if (Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &h_tbs_context) == TBS_SUCCESS) {
+        UINT32 handles[64] = { 0 };
+        UINT32 handle_count = 0;
+        UINT32 ek_handle = 0;
+        if (tpm_enumerate_persistent_handles(h_tbs_context, handles, &handle_count)) {
+            for (UINT32 i = 0; i < handle_count; i++) {
+                if (handles[i] >= 0x81010000 && handles[i] <= 0x810100FF) {
+                    ek_handle = handles[i];
+                    break;
+                }
+            }
+        }
+        if (ek_handle != 0) {
+            BYTE* ek_pub_tpm2b = NULL;
+            DWORD ek_pub_tpm2b_size = 0;
+            if (tpm_read_public_area(h_tbs_context, ek_handle, &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
+                DWORD bcrypt_blob_size = 0;
+                BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
+                if (bcrypt_blob) {
+                    info->ekPub = bcrypt_blob;
+                    info->ekPubSize = bcrypt_blob_size;
+                    sha256_hex(info->ekPub, info->ekPubSize, info->ekPubSha256);
+                    direct_success = TRUE;
+                }
+                free(ek_pub_tpm2b);
+            }
+        }
+        Tbsip_Context_Close(h_tbs_context);
     }
-    else {
-        sha256_hex(info->ekPub, info->ekPubSize, info->ekPubSha256);
+
+    if (!direct_success) {
+        printf("[!] Direct TPM public EK query failed. Reverting to original PCP property query...\n");
+        if (!read_ncrypt_property_bytes(h_prov, NCRYPT_PCP_EKPUB_PROPERTY, &info->ekPub, &info->ekPubSize)) {
+            info->ekPub = NULL;
+            info->ekPubSize = 0;
+        }
+        else {
+            sha256_hex(info->ekPub, info->ekPubSize, info->ekPubSha256);
+        }
     }
 
     info->hasEkCertStore = TRUE;

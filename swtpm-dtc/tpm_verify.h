@@ -147,6 +147,7 @@ BOOL blob_equals(const CRYPT_DATA_BLOB* a, const CRYPT_DATA_BLOB* b);
 BOOL get_cert_subject_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out);
 BOOL get_cert_authority_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out);
 BOOL get_tpm_info_via_ncrypt(TPMINFO* info);
+BOOL get_ek_cert_store_directly(HCERTSTORE* out_store);
 PCCERT_CONTEXT find_valid_issuer_in_store(HCERTSTORE store, PCCERT_CONTEXT subject);
 
 void free_wstringlist(WSTRINGLIST* list);
@@ -165,7 +166,7 @@ BOOL read_ncrypt_property_string(NCRYPT_PROV_HANDLE hProv, LPCWSTR prop, char* o
 BOOL get_tpm_info_via_tbs(TPMINFO* info);
 BOOL get_pcp_info(TPMINFO* info);
 BOOL get_pcp_ek_cert_store(NCRYPT_PROV_HANDLE hProv, HCERTSTORE* outStore);
-void load_certs_from_registry_recursive(HKEY hKey, HCERTSTORE store, WCHAR* szValueName);
+void load_certs_from_registry(HKEY hKey, HCERTSTORE store, WCHAR* szValueName);
 void load_tpm_intermediate_certs_from_registry(HCERTSTORE store);
 void load_certs_from_pcp_property_store(NCRYPT_PROV_HANDLE hProv, LPCWSTR propName, HCERTSTORE hStoreToAddTo);
 void load_pcp_intermediate_certs(HCERTSTORE store);

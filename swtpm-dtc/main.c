@@ -1,6 +1,8 @@
 #include "tpm_verify.h"
 #include "tpm_passthrough.h"
 
+BOOL get_ek_cert_store_directly(HCERTSTORE* out_store);
+
 BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
     HCERTSTORE hCabRoots,
     HCERTSTORE hCandidateStore,
@@ -250,18 +252,21 @@ int wmain(int argc, wchar_t* argv[]) {
     printf("Total Trusted Roots (CAB Strictly): %lu\n", (unsigned long)rootCount);
     printf("CAB intermediates: %lu\n", (unsigned long)intermediateCount);
 
-    printf("Loading EK certificate store from the TPM provider...\n");
-    {
+    printf("Loading EK certificate store directly from TPM NV memory...\n");
+    if (!get_ek_cert_store_directly(&hEkStore) || !hEkStore) {
+        printf("[!] Direct NV-RAM retrieval of EK certificates failed. Falling back to PCP property...\n");
+
         NCRYPT_PROV_HANDLE hProv = 0;
         SECURITY_STATUS s = NCryptOpenStorageProvider(&hProv, MS_PLATFORM_CRYPTO_PROVIDER, 0);
         if (s != ERROR_SUCCESS) {
             print_ntstatus("NCryptOpenStorageProvider", s);
+            printf("This TPM has no EK certificate.\n");
             goto cleanup;
         }
 
         if (!get_pcp_ek_cert_store(hProv, &hEkStore) || !hEkStore) {
             NCryptFreeObject(hProv);
-            printf("This TPM has no EK\n");
+            printf("This TPM has no EK certificate.\n");
             goto cleanup;
         }
         NCryptFreeObject(hProv);
