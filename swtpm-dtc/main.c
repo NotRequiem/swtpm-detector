@@ -348,5 +348,7 @@ cleanup:
     free(info.ekPub);
     free_filelist(&g_extracted);
     free(cab);
+
+    system("pause");
     return ok ? 0 : 1;
 }

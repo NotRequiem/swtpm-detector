@@ -288,7 +288,7 @@ static BOOL parse_tpm2b_public_rsa(const BYTE* tpm2b, DWORD tpm2b_size, UINT32* 
         read_16(&p);
     }
 
-    UINT16 key_bits = read_16(&p);
+    // UINT16 key_bits = read_16(&p);
     UINT32 exponent = read_32(&p);
     if (exponent == 0) {
         exponent = 65537;

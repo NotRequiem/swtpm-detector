@@ -629,43 +629,115 @@ Fail:
     return FALSE;
 }
 
-BOOL is_trusted_manufacturer_url(const WCHAR* url) {
-    if (!url) return FALSE;
+typedef struct {
+    const WCHAR* host;
+    const WCHAR* path;
+} TRUSTED_URL;
 
-    size_t len = wcslen(url);
-    WCHAR* lower = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
-    if (!lower) return FALSE;
-    for (size_t i = 0; i <= len; i++) {
-        lower[i] = (WCHAR)towlower(url[i]);
+static const TRUSTED_URL kTrustedManufacturerUrls[] = {
+    { L"ekop.intel.com", L"/ekcertservice" },
+    { L"ftpm.amd.com", L"/pki/aia" },
+    { L"ekcert.spserv.microsoft.com", L"/EKCertificate/GetEKCertificate/v1" }
+};
+
+static BOOL host_equals_ci(const WCHAR* a, size_t a_len, const WCHAR* b) {
+    size_t b_len = wcslen(b);
+    if (a_len != b_len) return FALSE;
+
+    for (size_t i = 0; i < a_len; i++) {
+        if (towlower(a[i]) != towlower(b[i])) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL extract_https_host_and_path(const WCHAR* url,
+    const WCHAR** out_host, size_t* out_host_len,
+    const WCHAR** out_path, size_t* out_path_len) {
+    const WCHAR* p;
+    const WCHAR* host_start;
+    const WCHAR* host_end;
+    const WCHAR* path_start;
+
+    if (!url || !out_host || !out_host_len || !out_path || !out_path_len) {
+        return FALSE;
     }
 
-    BOOL trusted = FALSE;
-    const WCHAR* trusted_domains[] = {
-        L"ftpm.amd.com",
-        L"download.amd.com",
-        L"intel.com",
-        L"trustedservices.intel.com",
-        L"ekop.intel.com",
-        L"tpmsec.microsoft.com",
-        L"microsoftaik.azure.net",
-        L"spserv.microsoft.com",
-        L"nuvoton.com",
-        L"infineon.com",
-        L"st.com",
-        L"globalsign.com",
-        L"globalsign.net",
-        L"qualcomm.com",
-        L"qcom.com",
-        L"nxp.com"
-    };
+    if (_wcsnicmp(url, L"https://", 8) != 0) {
+        return FALSE;
+    }
 
-    for (size_t i = 0; i < sizeof(trusted_domains) / sizeof(trusted_domains[0]); i++) {
-        if (wcsstr(lower, trusted_domains[i]) != NULL) {
-            trusted = TRUE;
+    host_start = url + 8;
+    if (*host_start == L'\0') {
+        return FALSE;
+    }
+
+    host_end = host_start;
+    while (*host_end && *host_end != L'/' && *host_end != L'?' && *host_end != L'#') {
+        host_end++;
+    }
+
+    if (host_end == host_start) {
+        return FALSE;
+    }
+
+    path_start = host_end;
+    if (*path_start == L'\0') {
+        path_start = L"/";
+    }
+
+    for (p = host_start; p < host_end; p++) {
+        if (*p == L'@' || *p == L'[' || *p == L']') {
+            return FALSE;
+        }
+    }
+
+    const WCHAR* colon = NULL;
+    for (p = host_start; p < host_end; p++) {
+        if (*p == L':') {
+            colon = p;
             break;
         }
     }
 
-    free(lower);
-    return trusted;
+    if (colon) {
+        if (colon == host_start) {
+            return FALSE;
+        }
+        *out_host = host_start;
+        *out_host_len = (size_t)(colon - host_start);
+    }
+    else {
+        *out_host = host_start;
+        *out_host_len = (size_t)(host_end - host_start);
+    }
+
+    *out_path = path_start;
+    *out_path_len = wcslen(path_start);
+    return TRUE;
+}
+
+BOOL is_trusted_manufacturer_url(const WCHAR* url) {
+    const WCHAR* host, * path;
+    size_t host_len, path_len;
+
+    if (!extract_https_host_and_path(url, &host, &host_len, &path, &path_len)) {
+        return FALSE;
+    }
+
+    for (size_t i = 0; i < sizeof(kTrustedManufacturerUrls) / sizeof(kTrustedManufacturerUrls[0]); i++) {
+        const TRUSTED_URL* t = &kTrustedManufacturerUrls[i];
+
+        if (host_equals_ci(host, host_len, t->host)) {
+            size_t trusted_path_len = wcslen(t->path);
+
+            if (path_len == trusted_path_len &&
+                wcsncmp(path, t->path, trusted_path_len) == 0) {
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
 }
