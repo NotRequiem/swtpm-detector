@@ -741,3 +741,87 @@ BOOL is_trusted_manufacturer_url(const WCHAR* url) {
 
     return FALSE;
 }
+
+BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
+    if (!cert || !cert->pCertInfo) return FALSE;
+
+    PCERT_EXTENSION pBasicConstraintsExt = CertFindExtension(
+        szOID_BASIC_CONSTRAINTS2,
+        cert->pCertInfo->cExtension,
+        cert->pCertInfo->rgExtension
+    );
+    if (!pBasicConstraintsExt) {
+        return FALSE;
+    }
+
+    CERT_BASIC_CONSTRAINTS2_INFO basicConstraints = { 0 };
+    DWORD cbBasicConstraints = sizeof(basicConstraints);
+    if (!CryptDecodeObjectEx(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        X509_BASIC_CONSTRAINTS2,
+        pBasicConstraintsExt->Value.pbData,
+        pBasicConstraintsExt->Value.cbData,
+        0,
+        NULL,
+        &basicConstraints,
+        &cbBasicConstraints)) {
+        return FALSE;
+    }
+
+    if (!basicConstraints.fCA) {
+        return FALSE;
+    }
+
+    PCERT_EXTENSION pKeyUsageExt = CertFindExtension(
+        szOID_KEY_USAGE,
+        cert->pCertInfo->cExtension,
+        cert->pCertInfo->rgExtension
+    );
+    if (pKeyUsageExt) {
+        CRYPT_BIT_BLOB keyUsage = { 0 };
+        DWORD cbKeyUsage = sizeof(keyUsage);
+        if (CryptDecodeObjectEx(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            X509_KEY_USAGE,
+            pKeyUsageExt->Value.pbData,
+            pKeyUsageExt->Value.cbData,
+            0,
+            NULL,
+            &keyUsage,
+            &cbKeyUsage)) {
+
+            if (keyUsage.cbData > 0) {
+                if (!(keyUsage.pbData[0] & CERT_KEY_CERT_SIGN_KEY_USAGE)) {
+                    return FALSE;
+                }
+            }
+        }
+    }
+    return TRUE;
+}
+
+
+BOOL check_cert_revocation(PCCERT_CONTEXT cert) {
+    if (!cert) return FALSE;
+
+    PVOID rgpvContext[1] = { (PVOID)cert };
+    CERT_REVOCATION_STATUS revStatus = { 0 };
+    revStatus.cbSize = sizeof(revStatus);
+
+    BOOL res = CertVerifyRevocation(
+        X509_ASN_ENCODING,
+        CERT_CONTEXT_REVOCATION_TYPE,
+        1,
+        rgpvContext,
+        0, 
+        NULL,
+        &revStatus
+    );
+
+    if (!res) {
+        if (revStatus.dwError == CRYPT_E_REVOKED) {
+            return FALSE; 
+        }
+    }
+    return TRUE;
+}

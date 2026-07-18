@@ -25,6 +25,18 @@ BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
         return FALSE;
     }
 
+    if (depth > 0) {
+        if (!check_issuer_basic_constraints_and_key_usage(leaf)) {
+            fprintf(out, "%*s[!] Basic Constraints/Key Usage validation failed (not a valid CA).\n", (int)(depth * 2), "");
+            return FALSE;
+        }
+    }
+
+    if (!check_cert_revocation(leaf)) {
+        fprintf(out, "%*s[!] Certificate revocation status verification failed (Certificate is REVOKED).\n", (int)(depth * 2), "");
+        return FALSE;
+    }
+
     if (cert_is_self_signed(leaf)) {
         if (cert_is_trusted_root(leaf, hCabRoots)) {
             fprintf(out, "%*sSelf-signed root found in the trusted root store.\n", (int)(depth * 2), "");
@@ -55,6 +67,7 @@ BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
                             if (is_trusted_manufacturer_url(urls.items[i])) {
                                 if (CertAddCertificateContextToStore(hCabRoots, downloaded, CERT_STORE_ADD_ALWAYS, NULL)) {
                                     fprintf(out, "%*s[+] Dynamic trust verified: Added downloaded manufacturer root to trusted store.\n", (int)(depth * 2) + 2, "");
+                                    printf("[!] Trusted root store should be strictly closed and pinned offline for 100% bypass remediation. Downloading AIA links externally could be unsafe");
                                 }
                             }
                             else {
