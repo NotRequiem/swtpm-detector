@@ -275,6 +275,7 @@ static BOOL parse_tpm2b_public_rsa(const BYTE* tpm2b, DWORD tpm2b_size, UINT32* 
     read_32(&p);
 
     UINT16 auth_policy_size = read_16(&p);
+    if (p.read_pos + auth_policy_size > tpm2b_size) return FALSE; 
     p.read_pos += auth_policy_size;
 
     UINT16 sym_alg = read_16(&p);
@@ -325,6 +326,7 @@ static BOOL parse_tpm2b_public_ecc(const BYTE* tpm2b, DWORD tpm2b_size, UINT16* 
     read_32(&p);
 
     UINT16 auth_policy_size = read_16(&p);
+    if (p.read_pos + auth_policy_size > tpm2b_size) return FALSE; 
     p.read_pos += auth_policy_size;
 
     UINT16 sym_alg = read_16(&p);
