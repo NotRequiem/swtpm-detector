@@ -168,9 +168,16 @@ BOOL is_pem_data(const BYTE* data, DWORD size) {
     return data && size >= sizeof(prefix) - 1 && memcmp(data, prefix, sizeof(prefix) - 1) == 0;
 }
 
+/*
 BOOL cert_equals(PCCERT_CONTEXT a, PCCERT_CONTEXT b) {
     if (!a || !b) return FALSE;
     return CertCompareCertificate(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, a->pCertInfo, b->pCertInfo);
+}
+*/
+BOOL cert_equals(PCCERT_CONTEXT a, PCCERT_CONTEXT b) {
+    if (!a || !b) return FALSE;
+    if (a->cbCertEncoded != b->cbCertEncoded) return FALSE;
+    return memcmp(a->pbCertEncoded, b->pbCertEncoded, a->cbCertEncoded) == 0;
 }
 
 BOOL store_contains_cert_exact(HCERTSTORE store, PCCERT_CONTEXT cert) {
@@ -515,46 +522,64 @@ BOOL get_cert_subject_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out) 
 
 BOOL get_cert_authority_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out) {
     PCCERT_EXTENSION ext = NULL;
-    PCERT_AUTHORITY_KEY_ID_INFO aki = NULL;
     DWORD cb = 0;
 
     if (!cert || !out) return FALSE;
     ZeroMemory(out, sizeof(*out));
 
-    ext = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER,
+    ext = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER2,
         cert->pCertInfo->cExtension,
         cert->pCertInfo->rgExtension);
-    if (!ext) {
-        ext = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER2,
-            cert->pCertInfo->cExtension,
-            cert->pCertInfo->rgExtension);
-    }
-    if (!ext) return FALSE;
-
-    if (!CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        X509_AUTHORITY_KEY_ID,
-        ext->Value.pbData,
-        ext->Value.cbData,
-        CRYPT_DECODE_ALLOC_FLAG,
-        NULL,
-        &aki,
-        &cb)) {
+    if (ext) {
+        PCERT_AUTHORITY_KEY_ID2_INFO aki2 = NULL;
+        if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            X509_AUTHORITY_KEY_ID2,
+            ext->Value.pbData,
+            ext->Value.cbData,
+            CRYPT_DECODE_ALLOC_FLAG,
+            NULL,
+            &aki2,
+            &cb)) {
+            if (aki2->KeyId.cbData && aki2->KeyId.pbData) {
+                out->pbData = (BYTE*)malloc(aki2->KeyId.cbData);
+                if (out->pbData) {
+                    memcpy(out->pbData, aki2->KeyId.pbData, aki2->KeyId.cbData);
+                    out->cbData = aki2->KeyId.cbData;
+                    LocalFree(aki2);
+                    return TRUE;
+                }
+            }
+            LocalFree(aki2);
+        }
         return FALSE;
     }
 
-    if (aki->KeyId.cbData && aki->KeyId.pbData) {
-        out->pbData = (BYTE*)malloc(aki->KeyId.cbData);
-        if (!out->pbData) {
-            LocalFree(aki);
-            return FALSE;
+    ext = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER,
+        cert->pCertInfo->cExtension,
+        cert->pCertInfo->rgExtension);
+    if (ext) {
+        PCERT_AUTHORITY_KEY_ID_INFO aki1 = NULL;
+        if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            X509_AUTHORITY_KEY_ID,
+            ext->Value.pbData,
+            ext->Value.cbData,
+            CRYPT_DECODE_ALLOC_FLAG,
+            NULL,
+            &aki1,
+            &cb)) {
+            if (aki1->KeyId.cbData && aki1->KeyId.pbData) {
+                out->pbData = (BYTE*)malloc(aki1->KeyId.cbData);
+                if (out->pbData) {
+                    memcpy(out->pbData, aki1->KeyId.pbData, aki1->KeyId.cbData);
+                    out->cbData = aki1->KeyId.cbData;
+                    LocalFree(aki1);
+                    return TRUE;
+                }
+            }
+            LocalFree(aki1);
         }
-        memcpy(out->pbData, aki->KeyId.pbData, aki->KeyId.cbData);
-        out->cbData = aki->KeyId.cbData;
-        LocalFree(aki);
-        return TRUE;
     }
 
-    LocalFree(aki);
     return FALSE;
 }
 
