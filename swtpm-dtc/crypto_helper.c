@@ -456,6 +456,29 @@ BOOL export_cert_public_key_blob(PCCERT_CONTEXT cert, BYTE** outBlob, DWORD* out
     return TRUE;
 }
 
+BOOL compare_ecc_blobs(const BYTE* a, DWORD a_size, const BYTE* b, DWORD b_size) {
+    if (a_size != b_size) return FALSE;
+    if (a_size < sizeof(BCRYPT_ECCKEY_BLOB)) return FALSE;
+
+    PBCRYPT_ECCKEY_BLOB hA = (PBCRYPT_ECCKEY_BLOB)a;
+    PBCRYPT_ECCKEY_BLOB hB = (PBCRYPT_ECCKEY_BLOB)b;
+
+    BOOL curve_match = FALSE;
+    if ((hA->dwMagic == BCRYPT_ECDH_PUBLIC_P256_MAGIC || hA->dwMagic == BCRYPT_ECDSA_PUBLIC_P256_MAGIC) &&
+        (hB->dwMagic == BCRYPT_ECDH_PUBLIC_P256_MAGIC || hB->dwMagic == BCRYPT_ECDSA_PUBLIC_P256_MAGIC)) {
+        curve_match = TRUE;
+    }
+    else if ((hA->dwMagic == BCRYPT_ECDH_PUBLIC_P384_MAGIC || hA->dwMagic == BCRYPT_ECDSA_PUBLIC_P384_MAGIC) &&
+        (hB->dwMagic == BCRYPT_ECDH_PUBLIC_P384_MAGIC || hB->dwMagic == BCRYPT_ECDSA_PUBLIC_P384_MAGIC)) {
+        curve_match = TRUE;
+    }
+
+    if (!curve_match) return FALSE;
+    if (hA->cbKey != hB->cbKey) return FALSE;
+
+    return memcmp(a + sizeof(BCRYPT_ECCKEY_BLOB), b + sizeof(BCRYPT_ECCKEY_BLOB), a_size - sizeof(BCRYPT_ECCKEY_BLOB)) == 0;
+}
+
 BOOL ekpub_matches_cert(PCCERT_CONTEXT cert, const BYTE* ekPub, DWORD ekPubSize) {
     BYTE* certBlob = NULL;
     DWORD certBlobSize = 0;
@@ -464,8 +487,14 @@ BOOL ekpub_matches_cert(PCCERT_CONTEXT cert, const BYTE* ekPub, DWORD ekPubSize)
     if (!cert || !ekPub || ekPubSize == 0) return FALSE;
 
     if (export_cert_public_key_blob(cert, &certBlob, &certBlobSize)) {
-        if (certBlobSize == ekPubSize && memcmp(certBlob, ekPub, ekPubSize) == 0) {
-            ok = TRUE;
+        if (certBlobSize == ekPubSize) {
+            if (certBlobSize >= sizeof(BCRYPT_ECCKEY_BLOB) &&
+                (certBlob[0] == 'E' && certBlob[1] == 'C')) {
+                ok = compare_ecc_blobs(certBlob, certBlobSize, ekPub, ekPubSize);
+            }
+            else {
+                ok = (memcmp(certBlob, ekPub, ekPubSize) == 0);
+            }
         }
         free(certBlob);
     }

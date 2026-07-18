@@ -307,7 +307,7 @@ int wmain(int argc, wchar_t* argv[]) {
             printf("  Issuer : %s\n", issuer[0] ? issuer : "(unknown)");
 
             if (!ekpub_matches_cert(c, info.ekPub, info.ekPubSize)) {
-                printf("  EK public key does not match this certificate.\n");
+                printf("  EK public key does not match this certificate (expected if this is the alternative RSA/ECC profile).\n");
                 continue;
             }
 
