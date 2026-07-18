@@ -468,21 +468,7 @@ BOOL ekpub_matches_cert(PCCERT_CONTEXT cert, const BYTE* ekPub, DWORD ekPubSize)
             ok = TRUE;
         }
         free(certBlob);
-        if (ok) return TRUE;
     }
-
-    {
-        BYTE* der = NULL;
-        DWORD derSize = 0;
-        if (cert_public_key_info_der(cert, &der, &derSize)) {
-            char a[65] = { 0 }, b[65] = { 0 };
-            if (sha256_hex(der, derSize, a) && sha256_hex(ekPub, ekPubSize, b) && strcmp(a, b) == 0) {
-                ok = TRUE;
-            }
-            free(der);
-        }
-    }
-
     return ok;
 }
 
