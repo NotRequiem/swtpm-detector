@@ -127,6 +127,31 @@ static bool is_admin() {
     return is_admin;
 }
 
+static BOOL has_ek_eku(PCCERT_CONTEXT cert) {
+    if (!cert || !cert->pCertInfo) return FALSE;
+
+    PCERT_EXTENSION pExt = CertFindExtension(szOID_ENHANCED_KEY_USAGE,
+        cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension);
+    if (!pExt) return FALSE;
+
+    PCERT_ENHKEY_USAGE pUsage = NULL;
+    DWORD cbUsage = 0;
+    if (CryptDecodeObjectEx(X509_ASN_ENCODING, szOID_ENHANCED_KEY_USAGE,
+        pExt->Value.pbData, pExt->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &pUsage, &cbUsage)) {
+
+        BOOL found = FALSE;
+        for (DWORD i = 0; i < pUsage->cUsageIdentifier; i++) {
+            if (strcmp(pUsage->rgpszUsageIdentifier[i], "2.23.133.8.1") == 0) { 
+                found = TRUE;
+                break;
+            }
+        }
+        LocalFree(pUsage);
+        return found;
+    }
+    return FALSE;
+}
+
 BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert,
     const BYTE* ekPub,
     DWORD ekPubSize,
@@ -142,6 +167,11 @@ BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert,
     }
 
     printf("  EK public key matches the EK certificate public key.\n");
+
+    if (!has_ek_eku(ekCert)) {
+        printf("[!] Validation failed: The certificate does not contain the mandatory Endorsement Key EKU (tcg-kp-EKCertificate). Possible spoofing detected.\n");
+        return FALSE;
+    }
 
     if (!manual_ek_chain_walk(ekCert, hCabRoots, hCandidateStore, 0, outPath, NULL, stdout)) {
         return FALSE;
