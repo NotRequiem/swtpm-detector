@@ -20,7 +20,10 @@ BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
     fprintf(out, "%*sSubject: %s\n", (int)(depth * 2), "", subject[0] ? subject : "(unknown)");
     fprintf(out, "%*sIssuer : %s\n", (int)(depth * 2), "", issuerName[0] ? issuerName : "(unknown)");
 
-    (void)CertVerifyTimeValidity(NULL, leaf->pCertInfo);
+    if (CertVerifyTimeValidity(NULL, leaf->pCertInfo) != 0) {
+        fprintf(out, "%*s[!] Certificate is expired or not yet valid.\n", (int)(depth * 2), "");
+        return FALSE;
+    }
 
     if (cert_is_self_signed(leaf)) {
         if (cert_is_trusted_root(leaf, hCabRoots)) {
