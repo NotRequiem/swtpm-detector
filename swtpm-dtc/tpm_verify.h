@@ -147,7 +147,7 @@ BOOL blob_equals(const CRYPT_DATA_BLOB* a, const CRYPT_DATA_BLOB* b);
 BOOL get_cert_subject_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out);
 BOOL get_cert_authority_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out);
 BOOL get_tpm_info_via_ncrypt(TPMINFO* info);
-BOOL get_ek_cert_store_directly(HCERTSTORE* out_store);
+BOOL get_ek_cert_store_from_nvram(HCERTSTORE* out_store);
 PCCERT_CONTEXT find_valid_issuer_in_store(HCERTSTORE store, PCCERT_CONTEXT subject);
 
 void free_wstringlist(WSTRINGLIST* list);

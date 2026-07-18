@@ -288,7 +288,8 @@ static BOOL parse_tpm2b_public_rsa(const BYTE* tpm2b, DWORD tpm2b_size, UINT32* 
         read_16(&p);
     }
 
-    // UINT16 key_bits = read_16(&p);
+    UINT16 key_bits = read_16(&p);
+    (key_bits);
     UINT32 exponent = read_32(&p);
     if (exponent == 0) {
         exponent = 65537;
@@ -591,7 +592,7 @@ static BYTE* tpm_read_full_nv_index(TBS_HCONTEXT h_tbs_context, UINT32 auth_hand
     return cert_buf;
 }
 
-BOOL get_ek_cert_store_directly(HCERTSTORE* out_store) {
+BOOL get_ek_cert_store_from_nvram(HCERTSTORE* out_store) {
     if (!out_store) return FALSE;
     *out_store = NULL;
 
@@ -941,7 +942,10 @@ static BOOL execute_possession_challenge(TBS_HCONTEXT h_tbs_context, UINT32 ek_h
     }
 
     BYTE challenge[16];
-    generate_stack_random(challenge, 16);
+    if (BCryptGenRandom(NULL, challenge, sizeof(challenge), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != STATUS_SUCCESS) {
+        generate_stack_random(challenge, 16);
+    }
+    
     printf("[*] Formulating challenge payload: ");
     for (int i = 0; i < 16; i++) {
         printf("%02X", challenge[i]);
@@ -1209,12 +1213,12 @@ BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
     info->ekPub = NULL;
     info->ekPubSize = 0;
 
-    TBS_CONTEXT_PARAMS2 params;
+    TBS_CONTEXT_PARAMS2 params = { 0 };
     params.version = TBS_CONTEXT_VERSION_TWO;
     params.includeTpm12 = 0;
     params.includeTpm20 = 1;
     TBS_HCONTEXT h_tbs_context = 0;
-    BOOL direct_success = FALSE;
+    BOOL nvram_success = FALSE;
 
     if (Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &h_tbs_context) == TBS_SUCCESS) {
         UINT32 handles[64] = { 0 };
@@ -1231,6 +1235,7 @@ BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
         if (ek_handle != 0) {
             BYTE* ek_pub_tpm2b = NULL;
             DWORD ek_pub_tpm2b_size = 0;
+
             if (tpm_read_public_area(h_tbs_context, ek_handle, &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
                 DWORD bcrypt_blob_size = 0;
                 BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
@@ -1238,7 +1243,7 @@ BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
                     info->ekPub = bcrypt_blob;
                     info->ekPubSize = bcrypt_blob_size;
                     sha256_hex(info->ekPub, info->ekPubSize, info->ekPubSha256);
-                    direct_success = TRUE;
+                    nvram_success = TRUE;
                 }
                 free(ek_pub_tpm2b);
             }
@@ -1246,7 +1251,7 @@ BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
         Tbsip_Context_Close(h_tbs_context);
     }
 
-    if (!direct_success) {
+    if (!nvram_success) {
         printf("[!] Direct TPM public EK query failed. Reverting to original PCP property query...\n");
         if (!read_ncrypt_property_bytes(h_prov, NCRYPT_PCP_EKPUB_PROPERTY, &info->ekPub, &info->ekPubSize)) {
             info->ekPub = NULL;

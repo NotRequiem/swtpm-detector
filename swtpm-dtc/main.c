@@ -251,7 +251,7 @@ int wmain(int argc, wchar_t* argv[]) {
     printf("CAB intermediates: %lu\n", (unsigned long)intermediateCount);
 
     printf("Loading EK certificate store directly from TPM NV memory...\n");
-    if (!get_ek_cert_store_directly(&hEkStore) || !hEkStore) {
+    if (!get_ek_cert_store_from_nvram(&hEkStore) || !hEkStore) {
         printf("[!] Direct NV-RAM retrieval of EK certificates failed. Falling back to PCP property...\n");
 
         NCRYPT_PROV_HANDLE hProv = 0;
