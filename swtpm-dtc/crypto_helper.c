@@ -761,26 +761,62 @@ BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
         cert->pCertInfo->cExtension,
         cert->pCertInfo->rgExtension
     );
+
+    LPCSTR lpszBCStructType = X509_BASIC_CONSTRAINTS2;
     if (!pBasicConstraintsExt) {
-        return FALSE;
+        pBasicConstraintsExt = CertFindExtension(
+            szOID_BASIC_CONSTRAINTS,
+            cert->pCertInfo->cExtension,
+            cert->pCertInfo->rgExtension
+        );
+        lpszBCStructType = X509_BASIC_CONSTRAINTS;
     }
 
-    CERT_BASIC_CONSTRAINTS2_INFO basicConstraints = { 0 };
-    DWORD cbBasicConstraints = sizeof(basicConstraints);
-    if (!CryptDecodeObjectEx(
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        X509_BASIC_CONSTRAINTS2,
-        pBasicConstraintsExt->Value.pbData,
-        pBasicConstraintsExt->Value.cbData,
-        0,
-        NULL,
-        &basicConstraints,
-        &cbBasicConstraints)) {
-        return FALSE;
+    if (!pBasicConstraintsExt) {
+        return FALSE; 
     }
 
-    if (!basicConstraints.fCA) {
-        return FALSE;
+    if (strcmp(lpszBCStructType, X509_BASIC_CONSTRAINTS2) == 0) {
+        CERT_BASIC_CONSTRAINTS2_INFO basicConstraints = { 0 };
+        DWORD cbBasicConstraints = sizeof(basicConstraints);
+        if (!CryptDecodeObjectEx(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            X509_BASIC_CONSTRAINTS2,
+            pBasicConstraintsExt->Value.pbData,
+            pBasicConstraintsExt->Value.cbData,
+            0,
+            NULL,
+            &basicConstraints,
+            &cbBasicConstraints)) {
+            return FALSE; 
+        }
+
+        if (!basicConstraints.fCA) {
+            return FALSE;
+        }
+    }
+    else {
+        PCERT_BASIC_CONSTRAINTS_INFO pLegacyBC = NULL;
+        DWORD cbLegacyBC = 0;
+        if (CryptDecodeObjectEx(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            X509_BASIC_CONSTRAINTS,
+            pBasicConstraintsExt->Value.pbData,
+            pBasicConstraintsExt->Value.cbData,
+            CRYPT_DECODE_ALLOC_FLAG,
+            NULL,
+            &pLegacyBC,
+            &cbLegacyBC)) {
+
+            BOOL isCA = pLegacyBC->SubjectType.pbData && (pLegacyBC->SubjectType.pbData[0] & CERT_CA_SUBJECT_FLAG);
+            LocalFree(pLegacyBC);
+            if (!isCA) {
+                return FALSE;
+            }
+        }
+        else {
+            return FALSE;
+        }
     }
 
     PCERT_EXTENSION pKeyUsageExt = CertFindExtension(
@@ -789,25 +825,39 @@ BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
         cert->pCertInfo->rgExtension
     );
     if (pKeyUsageExt) {
-        CRYPT_BIT_BLOB keyUsage = { 0 };
-        DWORD cbKeyUsage = sizeof(keyUsage);
+        PCRYPT_BIT_BLOB pKeyUsage = NULL;
+        DWORD cbKeyUsage = 0;
+
         if (CryptDecodeObjectEx(
             X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
             X509_KEY_USAGE,
             pKeyUsageExt->Value.pbData,
             pKeyUsageExt->Value.cbData,
-            0,
+            CRYPT_DECODE_ALLOC_FLAG,
             NULL,
-            &keyUsage,
+            &pKeyUsage,
             &cbKeyUsage)) {
 
-            if (keyUsage.cbData > 0) {
-                if (!(keyUsage.pbData[0] & CERT_KEY_CERT_SIGN_KEY_USAGE)) {
-                    return FALSE;
+            BOOL isSignBitSet = FALSE;
+            if (pKeyUsage->cbData > 0) {
+                if (pKeyUsage->pbData[0] & CERT_KEY_CERT_SIGN_KEY_USAGE) {
+                    isSignBitSet = TRUE;
                 }
             }
+            LocalFree(pKeyUsage);
+
+            if (!isSignBitSet) {
+                return FALSE;
+            }
+        }
+        else {
+            return FALSE; 
         }
     }
+    else {
+        return FALSE;
+    }
+
     return TRUE;
 }
 
