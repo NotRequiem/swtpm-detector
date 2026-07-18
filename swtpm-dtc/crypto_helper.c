@@ -762,21 +762,7 @@ BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
         cert->pCertInfo->rgExtension
     );
 
-    LPCSTR lpszBCStructType = X509_BASIC_CONSTRAINTS2;
-    if (!pBasicConstraintsExt) {
-        pBasicConstraintsExt = CertFindExtension(
-            szOID_BASIC_CONSTRAINTS,
-            cert->pCertInfo->cExtension,
-            cert->pCertInfo->rgExtension
-        );
-        lpszBCStructType = X509_BASIC_CONSTRAINTS;
-    }
-
-    if (!pBasicConstraintsExt) {
-        return FALSE; 
-    }
-
-    if (strcmp(lpszBCStructType, X509_BASIC_CONSTRAINTS2) == 0) {
+    if (pBasicConstraintsExt) {
         CERT_BASIC_CONSTRAINTS2_INFO basicConstraints = { 0 };
         DWORD cbBasicConstraints = sizeof(basicConstraints);
         if (!CryptDecodeObjectEx(
@@ -788,7 +774,7 @@ BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
             NULL,
             &basicConstraints,
             &cbBasicConstraints)) {
-            return FALSE; 
+            return FALSE;
         }
 
         if (!basicConstraints.fCA) {
@@ -796,6 +782,15 @@ BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
         }
     }
     else {
+        pBasicConstraintsExt = CertFindExtension(
+            szOID_BASIC_CONSTRAINTS,
+            cert->pCertInfo->cExtension,
+            cert->pCertInfo->rgExtension
+        );
+        if (!pBasicConstraintsExt) {
+            return FALSE; 
+        }
+
         PCERT_BASIC_CONSTRAINTS_INFO pLegacyBC = NULL;
         DWORD cbLegacyBC = 0;
         if (CryptDecodeObjectEx(
@@ -808,14 +803,15 @@ BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
             &pLegacyBC,
             &cbLegacyBC)) {
 
-            BOOL isCA = pLegacyBC->SubjectType.pbData && (pLegacyBC->SubjectType.pbData[0] & CERT_CA_SUBJECT_FLAG);
+            BOOL isCA = pLegacyBC->SubjectType.pbData &&
+                (pLegacyBC->SubjectType.pbData[0] & CERT_CA_SUBJECT_FLAG);
             LocalFree(pLegacyBC);
             if (!isCA) {
                 return FALSE;
             }
         }
         else {
-            return FALSE;
+            return FALSE; 
         }
     }
 
@@ -833,7 +829,7 @@ BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
             X509_KEY_USAGE,
             pKeyUsageExt->Value.pbData,
             pKeyUsageExt->Value.cbData,
-            CRYPT_DECODE_ALLOC_FLAG,
+            CRYPT_DECODE_ALLOC_FLAG, 
             NULL,
             &pKeyUsage,
             &cbKeyUsage)) {

@@ -67,7 +67,7 @@ BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
                             if (is_trusted_manufacturer_url(urls.items[i])) {
                                 if (CertAddCertificateContextToStore(hCabRoots, downloaded, CERT_STORE_ADD_ALWAYS, NULL)) {
                                     fprintf(out, "%*s[+] Dynamic trust verified: Added downloaded manufacturer root to trusted store.\n", (int)(depth * 2) + 2, "");
-                                    printf("[!] Trusted root store should be strictly closed and pinned offline for 100% bypass remediation. Downloading AIA links externally could be unsafe");
+                                    puts("[!] Trusted root store should be strictly closed and pinned offline for 100% bypass remediation. Downloading AIA links externally could be unsafe");
                                 }
                             }
                             else {
