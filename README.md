@@ -1,8 +1,8 @@
 # Spoofed TPM Detector
 
-> **`swtpm detection`**
+> **`pure swtpm/vtpm detection`**
 
-- A non-physical TPM will **never** possess a manufacturer-provisioned **private** EK whose corresponding certificate chains to a genuine certification authority.
+- A pure software TPM will **never** possess a manufacturer-provisioned **private** EK whose corresponding certificate chains to a genuine certification authority. A guest that is proxying commands to a physical TPM can absolutely present a genuine EK certificate chain.
 - Dumping a private EK is impossible without a vulnerability. Software can verify if you're in possession of the correct private EK by asking your TPM to decipher a random blob with the public EK.
 - Can't be bypassed when the detection is implemented properly.
 
@@ -52,8 +52,8 @@ tpm-verify.exe --cab "C:\Path\To\TrustedTpm.cab"
 ```
 
 ## Disclaimers
-This program is still in beta.
-
-This program is not designed to be tamper-resistant against memory modification or API call interception; it even allows you to put your own certificate database for testing purposes. Therefore, it is useless to try to bypass the program this way. The software is useful to check the integrity and trust of your own TPM.
+This program is not designed to be tamper-proves only that the guest has access to a trusted TPM-backed identity path, whether that is bare metal, passthrough, or a mediated/proxied designresistant against memory modification or API call interception; it even allows you to put your own certificate database for testing purposes. 
 
 TPMs without EKs exist, and there are legitimate purposes for regenerating them. Extra policy is needed. Developers using this idea may decide to block TPMs without EK or modified EKs, other people may decide to just flag/log it as a suspicious signal for future manual verification, others may decide to do extra checks in those cases, and others may decide to allow TPMs in those cases.
+
+The program probes that the guest has access to a trusted TPM-backed identity path, whether that is bare metal, passthrough, or a mediated/proxied design.
