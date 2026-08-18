@@ -157,6 +157,7 @@ BOOL wstringlist_contains(const WSTRINGLIST* list, const WCHAR* s);
 BOOL wstringlist_push(WSTRINGLIST* list, const WCHAR* s);
 BOOL url_is_http(const WCHAR* url);
 BOOL extract_aia_ca_issuers(PCCERT_CONTEXT cert, WSTRINGLIST* urls);
+BOOL calculate_sha256(const uint8_t* data, uint32_t size, uint8_t outDigest[32]);
 
 BOOL extract_cab_from_memory(const BYTE* cabData, DWORD cabSize);
 BOOL read_file_to_memory(const wchar_t* filePath, BYTE** outData, DWORD* outSize);
@@ -175,6 +176,7 @@ void load_pcp_intermediate_certs(HCERTSTORE store);
 BOOL build_candidate_issuer_store(HCERTSTORE hCabStore, HCERTSTORE hRoots, HCERTSTORE hCaStore, HCERTSTORE* outStore);
 
 BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ekCert);
+BOOL get_bootloader_authenticode_sha256(BYTE* outHash, DWORD* outHashSize);
 
 BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf, HCERTSTORE hCabRoots, HCERTSTORE hCandidateStore, DWORD depth, TRUST_PATH* outPath, PCCERT_CONTEXT* outLeaf, FILE* out);
 BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert, const BYTE* ekPub, DWORD ekPubSize, HCERTSTORE hCabRoots, HCERTSTORE hCandidateStore, TRUST_PATH* outPath, PCCERT_CONTEXT* outLeaf);

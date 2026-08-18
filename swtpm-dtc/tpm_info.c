@@ -1,4 +1,5 @@
 #include "tpm_verify.h"
+
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -8,6 +9,8 @@
 #include <strsafe.h>
 #include <tbs.h>
 #include <time.h>
+#include <wintrust.h>
+#include <mscat.h>
 
 #pragma comment(lib, "tbs.lib")
 
@@ -1709,6 +1712,8 @@ static BOOL parse_and_verify_attest_structure(const BYTE* attestBytes, UINT16 at
     UINT8 pcrSelect0 = read_8(&p);
     UINT8 pcrSelect1 = read_8(&p);
     UINT8 pcrSelect2 = read_8(&p);
+    (pcrSelect1);
+    (pcrSelect2);
     if (pcrSelect0 != 0xBE) { // Expects PCRs 1, 2, 3, 4, 5, 7 selected (0xBE)
         printf("[!] Attestation PCR selection mask mismatch: 0x%02X (expected 0xBE)\n", pcrSelect0);
         return FALSE;
@@ -1785,11 +1790,31 @@ BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, const BYTE* expecte
     tpm_flush_context(hTbsContext, akHandle);
 
     if (signedPcrDigestSize == 32) {
+        BYTE emptyPCRsZero[192] = { 0 };
+        BYTE emptyPCRsFF[192];
+        memset(emptyPCRsFF, 0xFF, sizeof(emptyPCRsFF));
+
+        BYTE unextendedZeroDigest[32] = { 0 };
+        BYTE unextendedFFDigest[32] = { 0 };
+
+        calculate_sha256(emptyPCRsZero, sizeof(emptyPCRsZero), unextendedZeroDigest);
+        calculate_sha256(emptyPCRsFF, sizeof(emptyPCRsFF), unextendedFFDigest);
+
+        if (memcmp(signedPcrDigest, unextendedZeroDigest, 32) == 0 ||
+            memcmp(signedPcrDigest, unextendedFFDigest, 32) == 0) {
+            printf("[!] Quote Verification Failure: Idle or unextended PCR state detected!\n");
+            printf("    The signed PCR digest matches default hardware initialization state (zeros/ones).\n");
+            printf("    This suggests proxying to an inactive secondary TPM or a simulated empty environment.\n");
+            *outQuoteVerified = FALSE;
+            tpm_flush_context(hTbsContext, akHandle);
+            return TRUE; 
+        }
         if (memcmp(signedPcrDigest, expectedPcrDigest, 32) == 0) {
+            printf("[+] Quote Detection: Reconstructed PCR digest matches the signed TPM Quote\n");
             *outQuoteVerified = TRUE;
         }
         else {
-            printf("[!] Quote Verification: Mismatch detected! Signed digest does not match guest reconstructed PCRs.\n");
+            printf("[!] Quote Detection: PCR digest mismatch! Signed digest does not match guest reconstructed PCRs.\n");
             printf("  Guest Reconstructed Digest (PCR 1,2,3,4,5,7): ");
             for (int i = 0; i < 32; i++) printf("%02x", expectedPcrDigest[i]);
             printf("\n");
@@ -1801,4 +1826,71 @@ BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, const BYTE* expecte
     }
 
     return TRUE;
+}
+
+typedef BOOL(WINAPI* pfnCryptCATAdminAcquireContext2)(
+    HCATADMIN* phCatAdmin,
+    const GUID* pgSubsystem,
+    PCWSTR pwszHashAlgorithm,
+    const CERT_STRONG_SIGN_PARA* pStrongHashPolicy,
+    DWORD dwFlags
+);
+
+typedef BOOL(WINAPI* pfnCryptCATAdminCalcHashFromFileHandle2)(
+    HCATADMIN hCatAdmin,
+    HANDLE hFile,
+    DWORD* pcbHash,
+    BYTE* pbHash,
+    DWORD dwFlags
+);
+
+typedef BOOL(WINAPI* pfnCryptCATAdminReleaseContext)(
+    HCATADMIN hCatAdmin,
+    DWORD dwFlags
+);
+
+BOOL get_bootloader_authenticode_sha256(BYTE* outHash, DWORD* outHashSize) {
+    if (!outHash || !outHashSize) return FALSE;
+
+    HMODULE hWintrust = LoadLibraryW(L"wintrust.dll");
+    if (!hWintrust) return FALSE;
+
+    pfnCryptCATAdminAcquireContext2 pAcquire = (pfnCryptCATAdminAcquireContext2)GetProcAddress(hWintrust, "CryptCATAdminAcquireContext2");
+    pfnCryptCATAdminCalcHashFromFileHandle2 pCalc = (pfnCryptCATAdminCalcHashFromFileHandle2)GetProcAddress(hWintrust, "CryptCATAdminCalcHashFromFileHandle2");
+    pfnCryptCATAdminReleaseContext pRelease = (pfnCryptCATAdminReleaseContext)GetProcAddress(hWintrust, "CryptCATAdminReleaseContext");
+
+    if (!pAcquire || !pCalc || !pRelease) {
+        FreeLibrary(hWintrust);
+        return FALSE;
+    }
+
+    const wchar_t* bootloaderPath = L"C:\\Windows\\Boot\\EFI\\bootmgfw.efi";
+    HANDLE hFile = CreateFileW(bootloaderPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        FreeLibrary(hWintrust);
+        return FALSE;
+    }
+
+    HCATADMIN hCatAdmin = NULL;
+    if (!pAcquire(&hCatAdmin, NULL, L"SHA256", NULL, 0)) {
+        CloseHandle(hFile);
+        FreeLibrary(hWintrust);
+        return FALSE;
+    }
+
+    DWORD cbHash = 0;
+    BOOL success = FALSE;
+    if (pCalc(hCatAdmin, hFile, &cbHash, NULL, 0)) {
+        if (cbHash <= 32) { 
+            if (pCalc(hCatAdmin, hFile, &cbHash, outHash, 0)) {
+                *outHashSize = cbHash;
+                success = TRUE;
+            }
+        }
+    }
+
+    pRelease(hCatAdmin, 0);
+    CloseHandle(hFile);
+    FreeLibrary(hWintrust);
+    return success;
 }

@@ -933,3 +933,43 @@ BOOL check_cert_revocation(PCCERT_CONTEXT cert) {
     }
     return TRUE;
 }
+
+BOOL calculate_sha256(const uint8_t* data, uint32_t size, uint8_t outDigest[32]) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    DWORD cbHashObject = 0;
+    DWORD cbData = sizeof(DWORD);
+    NTSTATUS status;
+
+    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (status != STATUS_SUCCESS) return FALSE;
+
+    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbHashObject, cbData, &cbData, 0);
+    if (status != STATUS_SUCCESS) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return FALSE;
+    }
+
+    BYTE* hashObject = (BYTE*)malloc(cbHashObject);
+    if (!hashObject) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return FALSE;
+    }
+
+    status = BCryptCreateHash(hAlg, &hHash, hashObject, cbHashObject, NULL, 0, 0);
+    if (status != STATUS_SUCCESS) {
+        free(hashObject);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return FALSE;
+    }
+
+    status = BCryptHashData(hHash, (PUCHAR)data, size, 0);
+    if (status == STATUS_SUCCESS) {
+        status = BCryptFinishHash(hHash, outDigest, 32, 0);
+    }
+
+    BCryptDestroyHash(hHash);
+    free(hashObject);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return (status == STATUS_SUCCESS);
+}

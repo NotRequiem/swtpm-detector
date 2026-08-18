@@ -125,46 +125,6 @@ static uint16_t algsizemap_get(const AlgSizeMap* map, uint16_t algId, BOOL* foun
     return 0;
 }
 
-static BOOL calculate_sha256(const uint8_t* data, uint32_t size, uint8_t outDigest[32]) {
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_HASH_HANDLE hHash = NULL;
-    DWORD cbHashObject = 0;
-    DWORD cbData = sizeof(DWORD);
-    NTSTATUS status;
-
-    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
-    if (status != STATUS_SUCCESS) return FALSE;
-
-    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbHashObject, cbData, &cbData, 0);
-    if (status != STATUS_SUCCESS) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
-    }
-
-    BYTE* hashObject = (BYTE*)malloc(cbHashObject);
-    if (!hashObject) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
-    }
-
-    status = BCryptCreateHash(hAlg, &hHash, hashObject, cbHashObject, NULL, 0, 0);
-    if (status != STATUS_SUCCESS) {
-        free(hashObject);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
-    }
-
-    status = BCryptHashData(hHash, (PUCHAR)data, size, 0);
-    if (status == STATUS_SUCCESS) {
-        status = BCryptFinishHash(hHash, outDigest, 32, 0);
-    }
-
-    BCryptDestroyHash(hHash);
-    free(hashObject);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return (status == STATUS_SUCCESS);
-}
-
 static BOOL read_tpm_pcr(TBS_HCONTEXT hContext, uint32_t pcrIndex, uint16_t algId, uint8_t* outDigest, uint32_t* outDigestSize) {
     uint8_t cmd[20] = { 0 };
     cmd[0] = 0x80; cmd[1] = 0x01;
@@ -428,6 +388,37 @@ BOOL detect_tpm_passthrough(void) {
             calculate_sha256(concat, 64, currentPCR);
         }
         memcpy(reconstructedPCRs[pcrIdx], currentPCR, 32);
+    }
+
+    printf("\n[*] Verifying Bootloader Authenticode Hash against TCG Event Log...\n");
+    BYTE calculatedBootHash[32];
+    DWORD calculatedBootHashSize = 0;
+
+    if (get_bootloader_authenticode_sha256(calculatedBootHash, &calculatedBootHashSize)) {
+        BOOL foundBootloaderInLog = FALSE;
+        #define EV_EFI_BOOT_SERVICES_APPLICATION 0x80000003
+
+        for (uint32_t z = 0; z < pcrEvents[4].count; z++) {
+            const TrackedEvent* ev = &pcrEvents[4].items[z];
+            if (ev->eventType == EV_EFI_BOOT_SERVICES_APPLICATION) {
+                if (ev->digestSize == calculatedBootHashSize && memcmp(ev->digest, calculatedBootHash, calculatedBootHashSize) == 0) {
+                    foundBootloaderInLog = TRUE;
+                    break;
+                }
+            }
+        }
+
+        if (foundBootloaderInLog) {
+            printf("[+] Active bootloader signature matches PCR[4] event logs.\n");
+        }
+        else {
+            printf("[!] Verification Warning: Active bootloader hash was NOT recorded in PCR[4] logs\n");
+            printf("    The presented event log may be spoofed or recorded from a different machine.\n");
+            passthroughDetected = TRUE;
+        }
+    }
+    else {
+        printf("[-] Warning: Skipping bootloader hash check (insufficient permissions / file locked).\n");
     }
 
     // 4. TPM Signed Quote Verification
