@@ -19,6 +19,9 @@ In summary, a probe that asks *"Is this the same TPM instance that the OEM origi
 
 > **`hypervisor proxying`**
 - A hypervisor that is proxying commands to a physical TPM can be detected by asking the TPM to sign a quote, because a hardware TPM will only sign a quote containing its own internal host PCR values.
+- Because the signature is calculated over the raw attestation data block (which contains the PCR selection and the PCR digest), any host-side modification of the PCR selection mask or the signed digest would cause the signature verification to fail when evaluated with the AK public key.
+
+> **`attaching a secondary TPM`**
 - An attacker could attach a discrete physical TPM like a cheap usb-based TPM, and the hypervisor could proxy the guest's TPM commands to this idle secondary TPM.
 - The attacker configures the virtual machine's TCG Event Log to be empty or to represent a clean, unextended state.
 - The Quote check succeeds because the idle physical TPM signs its empty PCRs, which match the guest's simulated empty TCG log. This way, the attacker doesn't have to deal with complex TCG reconstruction because it doesn't need to perfectly emulate a real host TCG log into the guest.
@@ -62,4 +65,6 @@ This program is not designed to be tamper-resistant against memory modification 
 
 TPMs without EKs exist, and there are legitimate purposes for regenerating them. Extra policy is needed. Developers using this idea may decide to block TPMs without EK or modified EKs, other people may decide to just flag/log it as a suspicious signal for future manual verification, others may decide to do extra checks in those cases, and others may decide to allow TPMs in those cases.
 
-The program probes that the guest has access to a trusted TPM-backed identity path, whether that is bare metal, passthrough, or a mediated/proxied design.
+The program probes that the guest has access to a trusted TPM-backed identity path.
+
+Attestation cannot be treated as a one-time gate. To prevent TOCTOU attacks, implement randomized periodic re-attestation loops.
