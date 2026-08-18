@@ -1,8 +1,8 @@
 # Spoofed TPM Detector
 
 > **`pure swtpm/vtpm detection`**
-
-- A pure software TPM will **never** possess a manufacturer-provisioned **private** EK whose corresponding certificate chains to a genuine certification authority. A guest that is proxying commands to a physical TPM can absolutely present a genuine EK certificate chain.
+- A pure software TPM will **never** possess a manufacturer-provisioned **private** EK whose corresponding certificate chains to a genuine certification authority.
+- A hypervisor that is proxying commands to a physical TPM can be detected by asking the TPM to sign a quote, because a hardware TPM will only sign a quote containing its own internal host PCR values.
 - Dumping a private EK is impossible without a vulnerability. Software can verify if you're in possession of the correct private EK by asking your TPM to decipher a random blob with the public EK.
 - Can't be bypassed when the detection is implemented properly.
 
@@ -52,7 +52,7 @@ tpm-verify.exe --cab "C:\Path\To\TrustedTpm.cab"
 ```
 
 ## Disclaimers
-This program is not designed to be tamper-resistant against memory modification or API call interception; it even allows you to put your own certificate database for testing purposes. 
+This program is not designed to be tamper-resistant against memory modification or API call interception; it even allows you to put your own certificate database for testing purposes. Bypassing this program by directly hooking it is not a valid bypass, because a detector could leverage the same methods used here and verify your TPM using remote attestation.
 
 TPMs without EKs exist, and there are legitimate purposes for regenerating them. Extra policy is needed. Developers using this idea may decide to block TPMs without EK or modified EKs, other people may decide to just flag/log it as a suspicious signal for future manual verification, others may decide to do extra checks in those cases, and others may decide to allow TPMs in those cases.
 

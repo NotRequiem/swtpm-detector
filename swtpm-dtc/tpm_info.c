@@ -374,7 +374,7 @@ static BOOL parse_tpm2b_public_ecc(const BYTE* tpm2b, DWORD tpm2b_size, UINT16* 
 }
 
 static BYTE* rsa_to_bcrypt_blob(UINT32 exponent, const BYTE* modulus, UINT16 modulus_size, DWORD* out_blob_size) {
-    BYTE exp_bytes[4];
+    BYTE exp_bytes[4] = { 0 };
     exp_bytes[0] = (exponent >> 24) & 0xFF;
     exp_bytes[1] = (exponent >> 16) & 0xFF;
     exp_bytes[2] = (exponent >> 8) & 0xFF;
@@ -601,7 +601,7 @@ BOOL get_ek_cert_store_from_nvram(HCERTSTORE* out_store) {
     HCERTSTORE h_store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
     if (!h_store) return FALSE;
 
-    TBS_CONTEXT_PARAMS2 params;
+    TBS_CONTEXT_PARAMS2 params = { 0 };
     params.version = TBS_CONTEXT_VERSION_TWO;
     params.includeTpm12 = 0;
     params.includeTpm20 = 1;
@@ -985,7 +985,7 @@ BOOL perform_local_tpm_pop_challenge(PCCERT_CONTEXT ek_cert) {
         return FALSE;
     }
 
-    TBS_CONTEXT_PARAMS2 params;
+    TBS_CONTEXT_PARAMS2 params = { 0 };
     params.version = TBS_CONTEXT_VERSION_TWO;
     params.includeTpm12 = 0;
     params.includeTpm20 = 1;
@@ -1286,7 +1286,7 @@ BOOL get_pcp_ek_cert_store(NCRYPT_PROV_HANDLE h_prov, HCERTSTORE* out_store) {
     return TRUE;
 }
 
-void load_certs_from_registry_recursive(HKEY h_key, HCERTSTORE store, WCHAR* sz_value_name) {
+static void load_certs_from_registry_recursive(HKEY h_key, HCERTSTORE store, WCHAR* sz_value_name) {
     DWORD dw_index = 0;
     DWORD cb_value_name = 16384;
     DWORD dw_type = 0;
@@ -1462,5 +1462,343 @@ BOOL build_candidate_issuer_store(HCERTSTORE h_cab_store, HCERTSTORE h_roots, HC
     if (h_lm_ca) CertCloseStore(h_lm_ca, 0);
 
     *out_store = h_store;
+    return TRUE;
+}
+
+#ifndef TPM_CC_Quote
+#define TPM_CC_Quote 0x00000158
+#endif
+
+// Low-level command serialization and submission for TPM2_Quote
+static BOOL tpm_quote(TBS_HCONTEXT hContext, UINT32 akHandle, const BYTE* nonce, UINT16 nonceSize, BYTE* outAttest, UINT16* outAttestSize, BYTE* outSig, UINT16* outSigSize) {
+    BYTE cmd[1024];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_SESSIONS);
+    write_32(&b, 0); // patched later with size
+    write_32(&b, TPM_CC_Quote);
+    write_32(&b, akHandle);
+
+    // Auth size and auth area (password authorization with empty password)
+    write_32(&b, 9);
+    write_32(&b, TPM_RS_PW);
+    write_16(&b, 0); // Empty nonce
+    write_8(&b, 0);  // Attributes
+    write_16(&b, 0); // Empty HMAC password
+
+    // qualifyingData
+    write_2b(&b, nonce, nonceSize);
+
+    // inScheme (signing scheme: TPM_ALG_NULL because the key has a predefined restricted scheme)
+    write_16(&b, TPM_ALG_NULL);
+
+    // PCRselect (TPML_PCR_SELECTION)
+    write_32(&b, 1); // count of selection structures = 1
+    write_16(&b, TPM_ALG_SHA256); // hash algorithm = TPM_ALG_SHA256
+    write_8(&b, 3); // sizeofSelect = 3 bytes
+    write_8(&b, 0xBE); // pcrSelect[0] = 0xBE (selects PCRs 1, 2, 3, 4, 5, 7. Excludes PCR 0 & 6 to prevent false positives)
+    write_8(&b, 0x00); // pcrSelect[1] = 0x00
+    write_8(&b, 0x00); // pcrSelect[2] = 0x00
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 respSize = sizeof(resp);
+    TBS_RESULT hr = Tbsip_Submit_Command(hContext, TBS_COMMAND_LOCALITY_ZERO, TBS_COMMAND_PRIORITY_NORMAL, cmd, b.write_pos, resp, &respSize);
+    if (hr != TBS_SUCCESS) {
+        printf("[!] Quote command failed: 0x%08X\n", hr);
+        return FALSE;
+    }
+
+    buf_parser p;
+    init_parser(&p, resp, respSize);
+    UINT16 tag = read_16(&p);
+    read_32(&p);
+    UINT32 rc = read_32(&p);
+    if (rc != 0) {
+        printf("[!] Quote returned error: 0x%08X\n", rc);
+        return FALSE;
+    }
+
+    if (tag == TPM_ST_SESSIONS) {
+        read_32(&p); // parameterSize
+    }
+
+    // Read quoted data (TPM2B_ATTEST)
+    UINT16 attestSize = read_16(&p);
+    if (attestSize == 0 || p.read_pos + attestSize > respSize) {
+        return FALSE;
+    }
+    if (outAttest && outAttestSize) {
+        memcpy(outAttest, p.buf + p.read_pos, attestSize);
+        *outAttestSize = attestSize;
+    }
+    p.read_pos += attestSize;
+
+    // Read signature (TPMT_SIGNATURE)
+    UINT16 sigAlg = read_16(&p);
+    if (sigAlg != TPM_ALG_RSASSA) {
+        printf("[!] Unsupported signature algorithm in quote: 0x%04X (expected RSA)\n", sigAlg);
+        return FALSE;
+    }
+
+    UINT16 hashAlg = read_16(&p);
+    if (hashAlg != TPM_ALG_SHA256) {
+        printf("[!] Unsupported signature hash algorithm: 0x%04X (expected SHA-256)\n", hashAlg);
+        return FALSE;
+    }
+
+    UINT16 sigSize = read_16(&p);
+    if (sigSize == 0 || p.read_pos + sigSize > respSize) {
+        return FALSE;
+    }
+    if (outSig && outSigSize) {
+        memcpy(outSig, p.buf + p.read_pos, sigSize);
+        *outSigSize = sigSize;
+    }
+
+    return TRUE;
+}
+
+// Cryptographically verify the RSA signature of the quote using BCrypt
+static BOOL verify_quote_signature(const BYTE* attestBytes, UINT16 attestSize, const BYTE* sigBytes, UINT16 sigSize, const BYTE* akPubTpm2b, DWORD akPubTpm2bSize) {
+    DWORD bcryptBlobSize = 0;
+    BYTE* bcryptBlob = tpm_public_to_bcrypt_blob(akPubTpm2b, akPubTpm2bSize, &bcryptBlobSize);
+    if (!bcryptBlob) {
+        printf("[!] Failed to convert AK public key to BCrypt blob.\n");
+        return FALSE;
+    }
+
+    BCRYPT_ALG_HANDLE hRsaAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    BCRYPT_ALG_HANDLE hHashAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    NTSTATUS status;
+
+    // Calculate SHA-256 hash of raw TPMS_ATTEST structure bytes
+    BYTE attestHash[32];
+    DWORD hashObjLen = 0, cbHashObjRead = sizeof(hashObjLen);
+
+    status = BCryptOpenAlgorithmProvider(&hHashAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (status != STATUS_SUCCESS) {
+        free(bcryptBlob);
+        return FALSE;
+    }
+
+    status = BCryptGetProperty(hHashAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&hashObjLen, cbHashObjRead, &cbHashObjRead, 0);
+    if (status != STATUS_SUCCESS) {
+        BCryptCloseAlgorithmProvider(hHashAlg, 0);
+        free(bcryptBlob);
+        return FALSE;
+    }
+
+    BYTE* hashObj = (BYTE*)malloc(hashObjLen);
+    if (!hashObj) {
+        BCryptCloseAlgorithmProvider(hHashAlg, 0);
+        free(bcryptBlob);
+        return FALSE;
+    }
+
+    status = BCryptCreateHash(hHashAlg, &hHash, hashObj, hashObjLen, NULL, 0, 0);
+    if (status == STATUS_SUCCESS) {
+        status = BCryptHashData(hHash, (PUCHAR)attestBytes, attestSize, 0);
+        if (status == STATUS_SUCCESS) {
+            status = BCryptFinishHash(hHash, attestHash, sizeof(attestHash), 0);
+        }
+        BCryptDestroyHash(hHash);
+    }
+    free(hashObj);
+    BCryptCloseAlgorithmProvider(hHashAlg, 0);
+
+    if (status != STATUS_SUCCESS) {
+        free(bcryptBlob);
+        return FALSE;
+    }
+
+    // Verify signature using the imported AK public key
+    status = BCryptOpenAlgorithmProvider(&hRsaAlg, BCRYPT_RSA_ALGORITHM, NULL, 0);
+    if (status != STATUS_SUCCESS) {
+        free(bcryptBlob);
+        return FALSE;
+    }
+
+    status = BCryptImportKeyPair(hRsaAlg, NULL, BCRYPT_RSAPUBLIC_BLOB, &hKey, bcryptBlob, bcryptBlobSize, 0);
+    if (status != STATUS_SUCCESS) {
+        BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+        free(bcryptBlob);
+        return FALSE;
+    }
+
+    BCRYPT_PKCS1_PADDING_INFO padInfo = { 0 };
+    padInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+
+    status = BCryptVerifySignature(hKey, &padInfo, attestHash, sizeof(attestHash), (PUCHAR)sigBytes, sigSize, BCRYPT_PAD_PKCS1);
+
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hRsaAlg, 0);
+    free(bcryptBlob);
+
+    return (status == STATUS_SUCCESS);
+}
+
+// Unmarshal and validate the fields of the TPMS_ATTEST structure
+static BOOL parse_and_verify_attest_structure(const BYTE* attestBytes, UINT16 attestSize, const BYTE* expectedNonce, UINT16 expectedNonceSize, BYTE* outPcrDigest, UINT16* outPcrDigestSize) {
+    buf_parser p;
+    init_parser(&p, attestBytes, attestSize);
+
+    // magic (4 bytes)
+    UINT32 magic = read_32(&p);
+    if (magic != 0xFF544347) { // TPM_GENERATED_VALUE
+        printf("[!] Attestation magic mismatch: 0x%08X (expected 0xFF544347)\n", magic);
+        return FALSE;
+    }
+
+    // type (2 bytes)
+    UINT16 type = read_16(&p);
+    if (type != 0x8018) { // TPM_ST_ATTEST_QUOTE
+        printf("[!] Attestation type mismatch: 0x%04X (expected 0x8018)\n", type);
+        return FALSE;
+    }
+
+    // qualifiedSigner (TPM2B_NAME)
+    UINT16 qualifiedSignerSize = read_16(&p);
+    p.read_pos += qualifiedSignerSize;
+
+    // extraData (TPM2B_DATA)
+    UINT16 extraDataSize = read_16(&p);
+    if (extraDataSize != expectedNonceSize) {
+        printf("[!] Attestation extraData size mismatch: %u (expected %u)\n", extraDataSize, expectedNonceSize);
+        return FALSE;
+    }
+    if (memcmp(p.buf + p.read_pos, expectedNonce, extraDataSize) != 0) {
+        printf("[!] Attestation extraData/nonce mismatch.\n");
+        return FALSE;
+    }
+    p.read_pos += extraDataSize;
+
+    // clockInfo (17 bytes)
+    p.read_pos += 8; // clock
+    p.read_pos += 4; // resetCount
+    p.read_pos += 4; // restartCount
+    p.read_pos += 1; // safe
+
+    // firmwareVersion (8 bytes)
+    p.read_pos += 8;
+
+    // attested (TPMS_QUOTE_INFO)
+    // pcrSelect (TPML_PCR_SELECTION)
+    UINT32 count = read_32(&p);
+    if (count != 1) {
+        printf("[!] Attestation PCR selection count mismatch: %u (expected 1)\n", count);
+        return FALSE;
+    }
+
+    UINT16 hashAlg = read_16(&p);
+    if (hashAlg != 0x000B) { // TPM_ALG_SHA256
+        printf("[!] Attestation PCR selection hash mismatch: 0x%04X (expected 0x000B)\n", hashAlg);
+        return FALSE;
+    }
+
+    UINT8 sizeofSelect = read_8(&p);
+    if (sizeofSelect != 3) {
+        printf("[!] Attestation PCR sizeofSelect mismatch: %u (expected 3)\n", sizeofSelect);
+        return FALSE;
+    }
+
+    UINT8 pcrSelect0 = read_8(&p);
+    UINT8 pcrSelect1 = read_8(&p);
+    UINT8 pcrSelect2 = read_8(&p);
+    if (pcrSelect0 != 0xBE) { // Expects PCRs 1, 2, 3, 4, 5, 7 selected (0xBE)
+        printf("[!] Attestation PCR selection mask mismatch: 0x%02X (expected 0xBE)\n", pcrSelect0);
+        return FALSE;
+    }
+
+    // pcrDigest (TPM2B_DIGEST)
+    UINT16 digestSize = read_16(&p);
+    if (digestSize != 32 || p.read_pos + digestSize > attestSize) {
+        printf("[!] Invalid PCR digest size in attestation: %u (expected 32)\n", digestSize);
+        return FALSE;
+    }
+
+    if (outPcrDigest && outPcrDigestSize) {
+        memcpy(outPcrDigest, p.buf + p.read_pos, digestSize);
+        *outPcrDigestSize = digestSize;
+    }
+
+    return TRUE;
+}
+
+BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, const BYTE* expectedPcrDigest, BOOL* outQuoteVerified) {
+    if (!expectedPcrDigest || !outQuoteVerified) return FALSE;
+    *outQuoteVerified = FALSE;
+
+    printf("[*] Loading transient AK inside Owner hierarchy...\n");
+    UINT32 akHandle = 0;
+    if (!tpm_create_primary_ak(hTbsContext, &akHandle)) {
+        printf("[!] Failed to load transient AK for Quote Verification.\n");
+        return FALSE;
+    }
+
+    BYTE nonce[16];
+    if (BCryptGenRandom(NULL, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != STATUS_SUCCESS) {
+        generate_stack_random(nonce, sizeof(nonce));
+    }
+
+    BYTE attestBytes[1024];
+    UINT16 attestSize = 0;
+    BYTE sigBytes[512];
+    UINT16 sigSize = 0;
+
+    printf("[*] Executing TPM2_Quote using AK...\n");
+    if (!tpm_quote(hTbsContext, akHandle, nonce, sizeof(nonce), attestBytes, &attestSize, sigBytes, &sigSize)) {
+        tpm_flush_context(hTbsContext, akHandle);
+        return FALSE;
+    }
+
+    printf("[*] Extracting AK public template...\n");
+    BYTE* akPubTpm2b = NULL;
+    DWORD akPubTpm2bSize = 0;
+    if (!tpm_read_public_area(hTbsContext, akHandle, &akPubTpm2b, &akPubTpm2bSize)) {
+        tpm_flush_context(hTbsContext, akHandle);
+        return FALSE;
+    }
+
+    printf("[*] Validating Quote signature integrity...\n");
+    if (!verify_quote_signature(attestBytes, attestSize, sigBytes, sigSize, akPubTpm2b, akPubTpm2bSize)) {
+        printf("[!] Quote signature verification failed.\n");
+        free(akPubTpm2b);
+        tpm_flush_context(hTbsContext, akHandle);
+        return FALSE;
+    }
+    free(akPubTpm2b);
+
+    BYTE signedPcrDigest[32];
+    UINT16 signedPcrDigestSize = 0;
+    printf("[*] Decoding attestation structure...\n");
+    if (!parse_and_verify_attest_structure(attestBytes, attestSize, nonce, sizeof(nonce), signedPcrDigest, &signedPcrDigestSize)) {
+        printf("[!] Attestation block validation failed.\n");
+        tpm_flush_context(hTbsContext, akHandle);
+        return FALSE;
+    }
+
+    tpm_flush_context(hTbsContext, akHandle);
+
+    if (signedPcrDigestSize == 32) {
+        if (memcmp(signedPcrDigest, expectedPcrDigest, 32) == 0) {
+            *outQuoteVerified = TRUE;
+        }
+        else {
+            printf("[!] Quote Verification: Mismatch detected! Signed digest does not match guest reconstructed PCRs.\n");
+            printf("  Guest Reconstructed Digest (PCR 1,2,3,4,5,7): ");
+            for (int i = 0; i < 32; i++) printf("%02x", expectedPcrDigest[i]);
+            printf("\n");
+            printf("  TPM Signed Digest (PCR 1,2,3,4,5,7)        : ");
+            for (int i = 0; i < 32; i++) printf("%02x", signedPcrDigest[i]);
+            printf("\n");
+            *outQuoteVerified = FALSE;
+        }
+    }
+
     return TRUE;
 }
