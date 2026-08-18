@@ -456,7 +456,7 @@ BOOL export_cert_public_key_blob(PCCERT_CONTEXT cert, BYTE** outBlob, DWORD* out
     return TRUE;
 }
 
-BOOL compare_ecc_blobs(const BYTE* a, DWORD a_size, const BYTE* b, DWORD b_size) {
+static BOOL compare_ecc_blobs(const BYTE* a, DWORD a_size, const BYTE* b, DWORD b_size) {
     if (a_size != b_size) return FALSE;
     if (a_size < sizeof(BCRYPT_ECCKEY_BLOB)) return FALSE;
 

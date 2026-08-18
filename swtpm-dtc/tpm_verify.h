@@ -166,10 +166,7 @@ BOOL download_url_to_memory(const wchar_t* url, BYTE** outData, DWORD* outSize);
 
 BOOL read_ncrypt_property_bytes(NCRYPT_PROV_HANDLE hProv, LPCWSTR prop, BYTE** outBuf, DWORD* outSize);
 BOOL read_ncrypt_property_string(NCRYPT_PROV_HANDLE hProv, LPCWSTR prop, char* out, size_t outChars);
-BOOL get_tpm_info_via_tbs(TPMINFO* info);
-BOOL get_pcp_info(TPMINFO* info);
 BOOL get_pcp_ek_cert_store(NCRYPT_PROV_HANDLE hProv, HCERTSTORE* outStore);
-void load_certs_from_registry(HKEY hKey, HCERTSTORE store, WCHAR* szValueName);
 void load_tpm_intermediate_certs_from_registry(HCERTSTORE store);
 void load_certs_from_pcp_property_store(NCRYPT_PROV_HANDLE hProv, LPCWSTR propName, HCERTSTORE hStoreToAddTo);
 void load_pcp_intermediate_certs(HCERTSTORE store);
