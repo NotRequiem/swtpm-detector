@@ -6,7 +6,7 @@
 #include <windows.h>
 #include <stdbool.h>
 
-	BOOL detect_tpm_passthrough(void);
-	BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, const BYTE* expectedPcrDigest, BOOL* outQuoteVerified);
+	BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert);
+	BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, PCCERT_CONTEXT ekCert, const BYTE* expectedPcrDigest, BOOL* outQuoteVerified);
 
 #endif

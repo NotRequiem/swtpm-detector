@@ -24,13 +24,13 @@
     <ClCompile Include="cab_extractor.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="crypto_helper.c">
+    <ClCompile Include="crypto.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="tpm_info.c">
+    <ClCompile Include="tpm.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="tpm_passthrough.c">
+    <ClCompile Include="passthrough.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

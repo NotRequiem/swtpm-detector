@@ -222,7 +222,7 @@ static void trace_pcr_reconstruction(const PcrEventList* list, const uint8_t* ac
     printf("\n");
 }
 
-BOOL detect_tpm_passthrough(void) {
+BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
     // 1. Local variable stuff
     TBS_CONTEXT_PARAMS2 params = { 0 };
     TBS_HCONTEXT hTbsContext = 0;
@@ -237,9 +237,9 @@ BOOL detect_tpm_passthrough(void) {
     uint32_t mismatchingIdxs[8] = { 0 };
     uint32_t mismatchingCount = 0;
 
-    uint8_t concatenatedGuestPCRs[192] = { 0 };
+    uint8_t concatenatedGuestPCRs[224] = { 0 };
     uint32_t offset_concat = 0;
-    uint32_t selectedPCRs[] = { 1, 2, 3, 4, 5, 7 };
+    uint32_t selectedPCRs[] = { 1, 2, 3, 4, 5, 6, 7 };
     uint8_t expectedPcrDigest[32];
     BOOL passthroughDetected = FALSE;
     BOOL quoteVerified = FALSE;
@@ -422,15 +422,15 @@ BOOL detect_tpm_passthrough(void) {
     }
 
     // 4. TPM Signed Quote Verification
-    printf("\n[*] Running TPM Signed Quote verification to detect selective proxying...\n");
+    printf("\n[*] Running TPM Signed Quote verification to detect proxying...\n");
 
-    for (i = 0; i < 6; ++i) {
+    for (i = 0; i < 7; ++i) {
         memcpy(concatenatedGuestPCRs + offset_concat, reconstructedPCRs[selectedPCRs[i]], 32);
         offset_concat += 32;
     }
 
     if (calculate_sha256(concatenatedGuestPCRs, sizeof(concatenatedGuestPCRs), expectedPcrDigest)) {
-        if (tpm_generate_quote_and_verify(hTbsContext, expectedPcrDigest, &quoteVerified)) {
+        if (tpm_generate_quote_and_verify(hTbsContext, ekCert, expectedPcrDigest, &quoteVerified)) {
             if (!quoteVerified) {
                 printf("[!] Proxying anomaly detected. Reconstructed guest digest doesn't match signed TPM digest.\n");
                 passthroughDetected = TRUE;
@@ -465,7 +465,7 @@ BOOL detect_tpm_passthrough(void) {
                 for (uint32_t j = 0; j < actualPCRSize; ++j) printf("%02x", actualPCR[j]);
                 printf("\n");
 
-                if (pcrIdx != 0 && pcrIdx != 6) {
+                if (pcrIdx != 0) {
                     passthroughDetected = TRUE;
                 }
             }

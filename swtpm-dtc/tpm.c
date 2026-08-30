@@ -1472,7 +1472,6 @@ BOOL build_candidate_issuer_store(HCERTSTORE h_cab_store, HCERTSTORE h_roots, HC
 #define TPM_CC_Quote 0x00000158
 #endif
 
-// Low-level command serialization and submission for TPM2_Quote
 static BOOL tpm_quote(TBS_HCONTEXT hContext, UINT32 akHandle, const BYTE* nonce, UINT16 nonceSize, BYTE* outAttest, UINT16* outAttestSize, BYTE* outSig, UINT16* outSigSize) {
     BYTE cmd[1024];
     buf_builder b;
@@ -1493,14 +1492,14 @@ static BOOL tpm_quote(TBS_HCONTEXT hContext, UINT32 akHandle, const BYTE* nonce,
     // qualifyingData
     write_2b(&b, nonce, nonceSize);
 
-    // inScheme (signing scheme: TPM_ALG_NULL because the key has a predefined restricted scheme)
+    // inScheme (TPM_ALG_NULL because the key has a predefined restricted scheme)
     write_16(&b, TPM_ALG_NULL);
 
     // PCRselect (TPML_PCR_SELECTION)
     write_32(&b, 1); // count of selection structures = 1
     write_16(&b, TPM_ALG_SHA256); // hash algorithm = TPM_ALG_SHA256
     write_8(&b, 3); // sizeofSelect = 3 bytes
-    write_8(&b, 0xBE); // pcrSelect[0] = 0xBE (selects PCRs 1, 2, 3, 4, 5, 7. Excludes PCR 0 & 6 to prevent false positives)
+    write_8(&b, 0xFE); // pcrSelect[0] = 0xFE (selects PCRs 1, 2, 3, 4, 5, 6, 7. Excludes PCR 0, read README.md)
     write_8(&b, 0x00); // pcrSelect[1] = 0x00
     write_8(&b, 0x00); // pcrSelect[2] = 0x00
 
@@ -1528,7 +1527,7 @@ static BOOL tpm_quote(TBS_HCONTEXT hContext, UINT32 akHandle, const BYTE* nonce,
         read_32(&p); // parameterSize
     }
 
-    // Read quoted data (TPM2B_ATTEST)
+    // TPM2B_ATTEST
     UINT16 attestSize = read_16(&p);
     if (attestSize == 0 || p.read_pos + attestSize > respSize) {
         return FALSE;
@@ -1539,7 +1538,7 @@ static BOOL tpm_quote(TBS_HCONTEXT hContext, UINT32 akHandle, const BYTE* nonce,
     }
     p.read_pos += attestSize;
 
-    // Read signature (TPMT_SIGNATURE)
+    //TPMT_SIGNATURE
     UINT16 sigAlg = read_16(&p);
     if (sigAlg != TPM_ALG_RSASSA) {
         printf("[!] Unsupported signature algorithm in quote: 0x%04X (expected RSA)\n", sigAlg);
@@ -1714,7 +1713,7 @@ static BOOL parse_and_verify_attest_structure(const BYTE* attestBytes, UINT16 at
     UINT8 pcrSelect2 = read_8(&p);
     (pcrSelect1);
     (pcrSelect2);
-    if (pcrSelect0 != 0xBE) { // Expects PCRs 1, 2, 3, 4, 5, 7 selected (0xBE)
+    if (pcrSelect0 != 0xFE) { // Expects PCRs 1, 2, 3, 4, 5, 6, 7 selected (0xFE)
         printf("[!] Attestation PCR selection mask mismatch: 0x%02X (expected 0xBE)\n", pcrSelect0);
         return FALSE;
     }
@@ -1734,14 +1733,65 @@ static BOOL parse_and_verify_attest_structure(const BYTE* attestBytes, UINT16 at
     return TRUE;
 }
 
-BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, const BYTE* expectedPcrDigest, BOOL* outQuoteVerified) {
-    if (!expectedPcrDigest || !outQuoteVerified) return FALSE;
+BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, PCCERT_CONTEXT ekCert, const BYTE* expectedPcrDigest, BOOL* outQuoteVerified) {
+    if (!hTbsContext || !ekCert || !expectedPcrDigest || !outQuoteVerified) return FALSE;
     *outQuoteVerified = FALSE;
 
-    printf("[*] Loading transient AK inside Owner hierarchy...\n");
+    UINT32 handles[64] = { 0 };
+    UINT32 handle_count = 0;
+    UINT32 preinstalled_ek_handle = 0;
+
+    if (tpm_enumerate_persistent_handles(hTbsContext, handles, &handle_count)) {
+        for (UINT32 i = 0; i < handle_count; i++) {
+            if (handles[i] >= 0x81010000 && handles[i] <= 0x810100FF) {
+                BYTE* ek_pub_tpm2b = NULL;
+                DWORD ek_pub_tpm2b_size = 0;
+                if (tpm_read_public_area(hTbsContext, handles[i], &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
+                    DWORD bcrypt_blob_size = 0;
+                    BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
+                    if (bcrypt_blob) {
+                        if (ekpub_matches_cert(ekCert, bcrypt_blob, bcrypt_blob_size)) {
+                            preinstalled_ek_handle = handles[i];
+                            free(bcrypt_blob);
+                            free(ek_pub_tpm2b);
+                            break;
+                        }
+                        free(bcrypt_blob);
+                    }
+                    free(ek_pub_tpm2b);
+                }
+            }
+        }
+    }
+
+    if (preinstalled_ek_handle == 0) {
+        printf("[!] Error: No persistent EK handle matching the validated EK certificate was found.\n");
+        return FALSE;
+    }
+    printf("[+] Target EK handle located: 0x%08X\n", preinstalled_ek_handle);
+
+    printf("[*] Loading transient AK under Owner hierarchy...\n");
     UINT32 akHandle = 0;
     if (!tpm_create_primary_ak(hTbsContext, &akHandle)) {
-        printf("[!] Failed to load transient AK for Quote Verification.\n");
+        printf("[!] Failed to load transient AK.\n");
+        return FALSE;
+    }
+    printf("[+] Transient AK loaded: 0x%08X\n", akHandle);
+
+    printf("[*] Executing Proof-of-Possession challenge to bind AK to validated EK...\n");
+    if (!execute_possession_challenge(hTbsContext, preinstalled_ek_handle, akHandle)) {
+        printf("[!] EK Proof-of-Possession challenge failed on this AK.\n");
+        tpm_flush_context(hTbsContext, akHandle);
+        return FALSE;
+    }
+    printf("[+] AK verified and bound to physical EK.\n");
+
+    printf("[*] Extracting AK public template...\n");
+    BYTE* akPubTpm2b = NULL;
+    DWORD akPubTpm2bSize = 0;
+    if (!tpm_read_public_area(hTbsContext, akHandle, &akPubTpm2b, &akPubTpm2bSize)) {
+        printf("[!] Failed to read public area of validated AK.\n");
+        tpm_flush_context(hTbsContext, akHandle);
         return FALSE;
     }
 
@@ -1755,25 +1805,20 @@ BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, const BYTE* expecte
     BYTE sigBytes[512];
     UINT16 sigSize = 0;
 
-    printf("[*] Executing TPM2_Quote using AK...\n");
+    printf("[*] Executing TPM2_Quote using the validated AK...\n");
     if (!tpm_quote(hTbsContext, akHandle, nonce, sizeof(nonce), attestBytes, &attestSize, sigBytes, &sigSize)) {
+        printf("[!] Quote command failed on validated AK.\n");
+        free(akPubTpm2b);
         tpm_flush_context(hTbsContext, akHandle);
         return FALSE;
     }
 
-    printf("[*] Extracting AK public template...\n");
-    BYTE* akPubTpm2b = NULL;
-    DWORD akPubTpm2bSize = 0;
-    if (!tpm_read_public_area(hTbsContext, akHandle, &akPubTpm2b, &akPubTpm2bSize)) {
-        tpm_flush_context(hTbsContext, akHandle);
-        return FALSE;
-    }
+    tpm_flush_context(hTbsContext, akHandle);
 
-    printf("[*] Validating Quote signature integrity...\n");
+    printf("[*] Validating Quote signature integrity against validated AK...\n");
     if (!verify_quote_signature(attestBytes, attestSize, sigBytes, sigSize, akPubTpm2b, akPubTpm2bSize)) {
         printf("[!] Quote signature verification failed.\n");
         free(akPubTpm2b);
-        tpm_flush_context(hTbsContext, akHandle);
         return FALSE;
     }
     free(akPubTpm2b);
@@ -1783,15 +1828,12 @@ BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, const BYTE* expecte
     printf("[*] Decoding attestation structure...\n");
     if (!parse_and_verify_attest_structure(attestBytes, attestSize, nonce, sizeof(nonce), signedPcrDigest, &signedPcrDigestSize)) {
         printf("[!] Attestation block validation failed.\n");
-        tpm_flush_context(hTbsContext, akHandle);
         return FALSE;
     }
 
-    tpm_flush_context(hTbsContext, akHandle);
-
     if (signedPcrDigestSize == 32) {
-        BYTE emptyPCRsZero[192] = { 0 };
-        BYTE emptyPCRsFF[192];
+        BYTE emptyPCRsZero[224] = { 0 }; // 7 PCRs * 32 bytes
+        BYTE emptyPCRsFF[224];
         memset(emptyPCRsFF, 0xFF, sizeof(emptyPCRsFF));
 
         BYTE unextendedZeroDigest[32] = { 0 };
@@ -1803,24 +1845,15 @@ BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, const BYTE* expecte
         if (memcmp(signedPcrDigest, unextendedZeroDigest, 32) == 0 ||
             memcmp(signedPcrDigest, unextendedFFDigest, 32) == 0) {
             printf("[!] Quote Verification Failure: Idle or unextended PCR state detected!\n");
-            printf("    The signed PCR digest matches default hardware initialization state (zeros/ones).\n");
-            printf("    This suggests proxying to an inactive secondary TPM or a simulated empty environment.\n");
             *outQuoteVerified = FALSE;
-            tpm_flush_context(hTbsContext, akHandle);
-            return TRUE; 
+            return TRUE;
         }
         if (memcmp(signedPcrDigest, expectedPcrDigest, 32) == 0) {
-            printf("[+] Quote Detection: Reconstructed PCR digest matches the signed TPM Quote\n");
+            printf("[+] Quote Detection: Reconstructed PCR digest matches the signed TPM Quote.\n");
             *outQuoteVerified = TRUE;
         }
         else {
             printf("[!] Quote Detection: PCR digest mismatch! Signed digest does not match guest reconstructed PCRs.\n");
-            printf("  Guest Reconstructed Digest (PCR 1,2,3,4,5,7): ");
-            for (int i = 0; i < 32; i++) printf("%02x", expectedPcrDigest[i]);
-            printf("\n");
-            printf("  TPM Signed Digest (PCR 1,2,3,4,5,7)        : ");
-            for (int i = 0; i < 32; i++) printf("%02x", signedPcrDigest[i]);
-            printf("\n");
             *outQuoteVerified = FALSE;
         }
     }

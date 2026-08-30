@@ -152,11 +152,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="cab_extractor.c" />
-    <ClCompile Include="crypto_helper.c" />
+    <ClCompile Include="crypto.c" />
     <ClCompile Include="downloader.c" />
     <ClCompile Include="main.c" />
-    <ClCompile Include="tpm_info.c" />
-    <ClCompile Include="tpm_passthrough.c" />
+    <ClCompile Include="tpm.c" />
+    <ClCompile Include="passthrough.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tpm_passthrough.h" />

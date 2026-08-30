@@ -192,13 +192,6 @@ BOOL store_contains_cert_exact(HCERTSTORE store, PCCERT_CONTEXT cert) {
     return FALSE;
 }
 
-BOOL is_self_signed(PCCERT_CONTEXT c) {
-    if (!c) return FALSE;
-    return CertCompareCertificateName(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        &c->pCertInfo->Subject,
-        &c->pCertInfo->Issuer);
-}
-
 BOOL cert_is_self_signed(PCCERT_CONTEXT cert) {
     if (!cert) return FALSE;
     if (!CertCompareCertificateName(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
@@ -367,7 +360,7 @@ BOOL build_cab_trust_stores(HCERTSTORE hCabStore, HCERTSTORE* outRoots, HCERTSTO
     }
 
     while ((c = CertEnumCertificatesInStore(hCabStore, c)) != NULL) {
-        if (is_self_signed(c)) {
+        if (cert_is_self_signed(c)) { 
             if (CertAddCertificateContextToStore(roots, c, CERT_STORE_ADD_ALWAYS, NULL)) rootCount++;
         }
         else {

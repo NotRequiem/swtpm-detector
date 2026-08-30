@@ -14,6 +14,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <strsafe.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <intrin.h>
 
 #ifdef _MSC_VER
     #pragma comment(lib, "winhttp.lib")
@@ -23,6 +26,7 @@
     #pragma comment(lib, "ncrypt.lib")
     #pragma comment(lib, "tbs.lib")
     #pragma comment(lib, "bcrypt.lib")
+    #pragma comment(lib, "wintrust.lib")
 #endif
 
 #ifndef STATUS_SUCCESS

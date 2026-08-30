@@ -1,13 +1,16 @@
 #include "tpm_verify.h"
 #include "tpm_passthrough.h"
 
+BOOL unsafe = FALSE;
+
 BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
     HCERTSTORE hCabRoots,
     HCERTSTORE hCandidateStore,
     DWORD depth,
     TRUST_PATH* outPath,
     PCCERT_CONTEXT* outLeaf,
-    FILE* out) {
+    FILE* out) 
+{
     PCCERT_CONTEXT issuer = NULL;
     char subject[1024] = { 0 };
     char issuerName[1024] = { 0 };
@@ -68,6 +71,7 @@ BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
                                 if (CertAddCertificateContextToStore(hCabRoots, downloaded, CERT_STORE_ADD_ALWAYS, NULL)) {
                                     fprintf(out, "%*s[+] Dynamic trust verified: Added downloaded manufacturer root to trusted store.\n", (int)(depth * 2) + 2, "");
                                     puts("[!] Trusted root store should be strictly closed and pinned offline for 100% bypass remediation. Downloading AIA links externally could be unsafe");
+                                    unsafe = TRUE;
                                 }
                             }
                             else {
@@ -178,15 +182,7 @@ BOOL verify_ek_by_manual_chain(PCCERT_CONTEXT ekCert,
     }
 
     if (!is_admin()) {
-        printf("[!] Admin permissions required to perform the EK challenge. If this check doesn't run, the TPM can be spoofed by just dumping a valid public EK.\n");
-        return FALSE;
-    }
-
-    if (perform_local_tpm_pop_challenge(ekCert)) {
-        printf("TPM is physical. Proved to possess the private EK.\n");
-    }
-    else {
-        printf("The TPM is spoofed with a valid certificate and EK. This is a software TPM.\n");
+        printf("[!] Admin permissions required to perform hardware-bound attestation.\n");
         return FALSE;
     }
 
@@ -214,6 +210,34 @@ static void print_cert_count(HCERTSTORE store, const char* label) {
     }
     while ((c = CertEnumCertificatesInStore(store, c)) != NULL) count++;
     printf("%s: %lu\n", label, (unsigned long)count);
+}
+
+BOOL verify_cab_authenticode(const wchar_t* cabFilePath) {
+    WINTRUST_FILE_INFO fileInfo = { 0 };
+    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+    fileInfo.pcwszFilePath = cabFilePath;
+
+    WINTRUST_DATA trustData = { 0 };
+    trustData.cbStruct = sizeof(WINTRUST_DATA);
+    trustData.dwUIChoice = WTD_UI_NONE;
+    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trustData.dwUnionChoice = WTD_CHOICE_FILE;
+    trustData.pFile = &fileInfo;
+    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    trustData.dwProvFlags = WTD_REVOCATION_CHECK_NONE;
+
+    GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    LONG status = WinVerifyTrust(NULL, &policyGuid, &trustData);
+
+    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &policyGuid, &trustData);
+
+    if (status != ERROR_SUCCESS) {
+        printf("[!] TrustedTpm.cab Authenticode verification FAILED (0x%08X). Modified or spoofed CAB file!\n", status);
+        return FALSE;
+    }
+    printf("[+] TrustedTpm.cab Authenticode signature verified (Official Microsoft Signature).\n");
+    return TRUE;
 }
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -247,11 +271,16 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     if (localCabPath) {
+        if (!verify_cab_authenticode(localCabPath)) {
+            printf("Cabinet file is spoofed (not digitally signed).\n");
+            goto cleanup;
+        }
         wprintf(L"Loading local Cabinet package from: %s...\n", localCabPath);
         if (!read_file_to_memory(localCabPath, &cab, &cabSize)) {
             fwprintf(stderr, L"Failed to read local file: %s\n", localCabPath);
             goto cleanup;
         }
+        unsafe = true;
     }
     else {
         printf("Downloading TrustedTpm.cab from Microsoft...\n");
@@ -336,6 +365,11 @@ int wmain(int argc, wchar_t* argv[]) {
             printf("  Subject: %s\n", subject[0] ? subject : "(unknown)");
             printf("  Issuer : %s\n", issuer[0] ? issuer : "(unknown)");
 
+            if (strstr(issuer, "Microsoft TPM Identity") || strstr(issuer, "microsoftaik")) {
+                printf("[!] Certificate is a virtual identity issued by Microsoft Cloud CA, not physical hardware.\n");
+                continue;
+            }
+
             if (!ekpub_matches_cert(c, info.ekPub, info.ekPubSize)) {
                 printf("  EK public key does not match this certificate (expected if this is the alternative RSA/ECC profile).\n");
                 continue;
@@ -374,14 +408,21 @@ int wmain(int argc, wchar_t* argv[]) {
         printf("\n\nResult: TPM is legit.\n");
     }
 
-    printf("\n[*] Starting passthrough checks...\n");
-    if (!detect_tpm_passthrough()) {
-        printf("\n\nResult: Passed-through virtualized hardware detected.\n");
+    printf("\n[*] Starting passthrough and hardware-bound Quote verification...\n");
+    if (!detect_tpm_passthrough(ekLeaf)) {
+        printf("\n\nResult: Passed-through virtualized hardware or spoofed TPM detected.\n");
         ok = FALSE;
     }
     else {
-        printf("\n\nResult: Real hardware TPM verified.\n");
+        if (unsafe) {
+            printf("[!] TPM could be spoofed, either EK certificate had to be downloaded from Internet, or user introduced a local Cabinet file.\n");
+        }
+        else {
+            printf("\n\nResult: This machine has access to a verified physical hardware TPM.\n");
+        }
     }
+
+    printf("Running version: v2.0\n");
 
 cleanup:
     if (ekLeaf) CertFreeCertificateContext(ekLeaf);
