@@ -1,4 +1,4 @@
-#include "tpm_verify.h"  
+#include "tpm_verify.h"
 #include "tpm_passthrough.h"
 
 #include <bcrypt.h>
@@ -9,30 +9,17 @@
 #include <string.h>
 
 #ifdef _MSC_VER
-    #pragma comment(lib, "tbs.lib")
-    #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "tbs.lib")
+#pragma comment(lib, "bcrypt.lib")
 #endif
 
 #ifdef TBS_TCGLOG_SRTM_CURRENT
-    #undef TBS_TCGLOG_SRTM_CURRENT
+#undef TBS_TCGLOG_SRTM_CURRENT
 #endif
-
 #define TBS_TCGLOG_SRTM_CURRENT 0
 
-#ifndef TBS_TCGLOG_DRTM_CURRENT
-    #define TBS_TCGLOG_DRTM_CURRENT 1
-#endif
-
 #ifndef TPM_ALG_SHA256
-    #define TPM_ALG_SHA256 0x000B
-#endif
-
-#ifndef STATUS_SUCCESS
-    #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
-#endif
-
-#ifndef NCRYPTBUFFER_VERSION
-    #define NCRYPTBUFFER_VERSION 0
+#define TPM_ALG_SHA256 0x000B
 #endif
 
 #pragma pack(push, 1)
@@ -82,9 +69,9 @@ static BOOL pcreventlist_push(PcrEventList* list, uint32_t eventType, const uint
         list->capacity = newCap;
     }
     list->items[list->count].eventType = eventType;
-    list->items[list->count].digestSize = digestSize;
+    list->items[list->count].digestSize = (digestSize > 32) ? 32 : digestSize;
     memset(list->items[list->count].digest, 0, 32);
-    memcpy(list->items[list->count].digest, digest, digestSize > 32 ? 32 : digestSize);
+    memcpy(list->items[list->count].digest, digest, list->items[list->count].digestSize);
     list->count++;
     return TRUE;
 }
@@ -127,41 +114,40 @@ static uint16_t algsizemap_get(const AlgSizeMap* map, uint16_t algId, BOOL* foun
 
 static BOOL read_tpm_pcr(TBS_HCONTEXT hContext, uint32_t pcrIndex, uint16_t algId, uint8_t* outDigest, uint32_t* outDigestSize) {
     uint8_t cmd[20] = { 0 };
-    cmd[0] = 0x80; cmd[1] = 0x01;
-    cmd[2] = 0x00; cmd[3] = 0x00; cmd[4] = 0x00; cmd[5] = 0x14;
-    cmd[6] = 0x00; cmd[7] = 0x00; cmd[8] = 0x01; cmd[9] = 0x7E;
-    cmd[10] = 0x00; cmd[11] = 0x00; cmd[12] = 0x00; cmd[13] = 0x01;
+    cmd[0] = 0x80; cmd[1] = 0x01; // TPM_ST_NO_SESSIONS
+    cmd[2] = 0x00; cmd[3] = 0x00; cmd[4] = 0x00; cmd[5] = 0x14; // Size: 20 bytes
+    cmd[6] = 0x00; cmd[7] = 0x00; cmd[8] = 0x01; cmd[9] = 0x7E; // TPM_CC_PCR_Read (0x0000017E)
+    cmd[10] = 0x00; cmd[11] = 0x00; cmd[12] = 0x00; cmd[13] = 0x01; // TPML_PCR_SELECTION count = 1
 
     cmd[14] = (algId >> 8) & 0xFF;
     cmd[15] = algId & 0xFF;
-    cmd[16] = 0x03;
+    cmd[16] = 0x03; // sizeofSelect = 3 bytes (PCRs 0-23)
     cmd[17] = 0x00;
     cmd[18] = 0x00;
     cmd[19] = 0x00;
-    cmd[17 + (pcrIndex / 8)] = 1 << (pcrIndex % 8);
+    if (pcrIndex < 24) {
+        cmd[17 + (pcrIndex / 8)] = (uint8_t)(1 << (pcrIndex % 8));
+    }
 
     uint8_t resp[256];
     uint32_t respSize = sizeof(resp);
 
     TBS_RESULT hr = Tbsip_Submit_Command(hContext, TBS_COMMAND_LOCALITY_ZERO, TBS_COMMAND_PRIORITY_NORMAL, cmd, sizeof(cmd), resp, &respSize);
-    if (hr != TBS_SUCCESS) return FALSE;
+    if (hr != TBS_SUCCESS || respSize < 10) return FALSE;
 
-    if (respSize < 10) return FALSE;
-    uint32_t code = ((uint32_t)resp[6] << 24) | ((uint32_t)resp[7] << 16) | ((uint32_t)resp[8] << 8) | resp[9];
-    if (code != 0) return FALSE;
+    uint32_t rc = ((uint32_t)resp[6] << 24) | ((uint32_t)resp[7] << 16) | ((uint32_t)resp[8] << 8) | resp[9];
+    if (rc != 0) return FALSE;
 
-    uint32_t offset = 10;
-    offset += 4;
-
+    uint32_t offset = 14; // Skip header (10) + pcrUpdateCounter (4)
     if (offset + 4 > respSize) return FALSE;
     uint32_t selCount = ((uint32_t)resp[offset] << 24) | ((uint32_t)resp[offset + 1] << 16) | ((uint32_t)resp[offset + 2] << 8) | resp[offset + 3];
     offset += 4;
     if (selCount != 1) return FALSE;
 
-    offset += 2;
+    offset += 2; // Skip hash alg
     if (offset + 1 > respSize) return FALSE;
-    uint8_t retSizeofSelect = resp[offset];
-    offset += 1 + retSizeofSelect;
+    uint8_t retSizeofSelect = resp[offset++];
+    offset += retSizeofSelect;
 
     if (offset + 4 > respSize) return FALSE;
     uint32_t digestCount = ((uint32_t)resp[offset] << 24) | ((uint32_t)resp[offset + 1] << 16) | ((uint32_t)resp[offset + 2] << 8) | resp[offset + 3];
@@ -192,38 +178,29 @@ static void trace_pcr_reconstruction(const PcrEventList* list, const uint8_t* ac
         const TrackedEvent* ev = &list->items[i];
         printf("[Event %3u] Type: 0x%08X", i + 1, ev->eventType);
 
-        if (ev->eventType == 0x00000003) {
-            printf(" - (EV_NO_ACTION)\n");
+        if (ev->eventType == 0x00000003) { 
+            printf(" - (EV_NO_ACTION - not extended)\n");
             continue;
         }
         else {
             printf(" - Extending...\n");
         }
 
-        printf("Incoming Measurement Digest: ");
-        for (uint32_t j = 0; j < ev->digestSize; j++) printf("%02x", ev->digest[j]);
-        printf("\n");
-
         uint8_t concat[64];
         memcpy(concat, currentPCR, 32);
         memcpy(concat + 32, ev->digest, 32);
         calculate_sha256(concat, 64, currentPCR);
-
-        printf("Resulting Register State: ");
-        for (int j = 0; j < 32; j++) printf("%02x", currentPCR[j]);
-        printf("\n");
     }
 
-    printf("Reconstructed PCR: ");
+    printf("Reconstructed PCR : ");
     for (int i = 0; i < 32; i++) printf("%02x", currentPCR[i]);
     printf("\n");
-    printf("Actual hardware PCR : ");
+    printf("Hardware Register : ");
     for (uint32_t i = 0; i < actualPCRSize; i++) printf("%02x", actualPCR[i]);
     printf("\n");
 }
 
 BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
-    // 1. Local variable stuff
     TBS_CONTEXT_PARAMS2 params = { 0 };
     TBS_HCONTEXT hTbsContext = 0;
     TBS_RESULT hr = TBS_SUCCESS;
@@ -249,10 +226,8 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
     uint32_t actualPCRSize = 0;
     uint32_t i = 0;
 
-    // 2. Establish TBS context
     params.version = TBS_CONTEXT_VERSION_TWO;
     params.asUINT32 = 0;
-    params.requestRaw = 1;
     params.includeTpm20 = 1;
 
     hr = Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &hTbsContext);
@@ -261,7 +236,6 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         return FALSE;
     }
 
-    // 3. Download TCG Log
     hr = Tbsi_Get_TCG_Log_Ex(TBS_TCGLOG_SRTM_CURRENT, NULL, &logSize);
     if (hr != TBS_E_INSUFFICIENT_BUFFER && hr != TBS_SUCCESS) {
         printf("[-] Failed to retrieve log size. Code: 0x%08lX\n", (unsigned long)hr);
@@ -285,14 +259,13 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
     printf("[+] Downloaded TCG Log (%lu bytes).\n", (unsigned long)logSize);
 
     algsizemap_init(&algToSize);
-    algsizemap_set(&algToSize, 0x0004, 20);
+    algsizemap_set(&algToSize, 0x0004, 20); 
     algsizemap_set(&algToSize, TPM_ALG_SHA256, 32);
 
     for (i = 0; i < 24; ++i) {
         pcreventlist_init(&pcrEvents[i]);
     }
 
-    // Parse Spec ID Event
     if (offset + sizeof(TCG_PCR_EVENT_HEADER) <= logSize) {
         const TCG_PCR_EVENT_HEADER* firstHeader = (const TCG_PCR_EVENT_HEADER*)(logBuffer + offset);
         offset += sizeof(TCG_PCR_EVENT_HEADER);
@@ -317,7 +290,6 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         }
     }
 
-    // Traverse Event Log
     while (offset < logSize) {
         if (offset + 8 > logSize) break;
         uint32_t pcrIndex = *(const uint32_t*)(logBuffer + offset);
@@ -345,8 +317,7 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
 
             BOOL found = FALSE;
             uint16_t size = algsizemap_get(&algToSize, algId, &found);
-            if (!found) { parseSuccess = FALSE; break; }
-            if (offset + size > logSize) { parseSuccess = FALSE; break; }
+            if (!found || offset + size > logSize) { parseSuccess = FALSE; break; }
 
             if (tempDigestCount < 16) {
                 tempDigests[tempDigestCount].algId = algId;
@@ -373,7 +344,6 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         }
     }
 
-    // Reconstruct PCR registers
     memset(reconstructedPCRs, 0, sizeof(reconstructedPCRs));
     for (pcrIdx = 0; pcrIdx < 8; ++pcrIdx) {
         uint8_t currentPCR[32] = { 0 };
@@ -390,13 +360,13 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         memcpy(reconstructedPCRs[pcrIdx], currentPCR, 32);
     }
 
-    printf("\n[*] Verifying Bootloader Authenticode Hash against TCG Event Log...\n");
+    printf("\n[*] Verifying Windows Bootloader Authenticode Hash against TCG Event Log...\n");
     BYTE calculatedBootHash[32];
     DWORD calculatedBootHashSize = 0;
 
     if (get_bootloader_authenticode_sha256(calculatedBootHash, &calculatedBootHashSize)) {
         BOOL foundBootloaderInLog = FALSE;
-        #define EV_EFI_BOOT_SERVICES_APPLICATION 0x80000003
+#define EV_EFI_BOOT_SERVICES_APPLICATION 0x80000003
 
         for (uint32_t z = 0; z < pcrEvents[4].count; z++) {
             const TrackedEvent* ev = &pcrEvents[4].items[z];
@@ -412,18 +382,16 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
             printf("[+] Active bootloader signature matches PCR[4] event logs.\n");
         }
         else {
-            printf("[!] Verification Warning: Active bootloader hash was NOT recorded in PCR[4] logs\n");
-            printf("    The presented event log may be spoofed or recorded from a different machine.\n");
+            printf("[!] Verification Failure: Active bootloader hash was NOT found in PCR[4] logs.\n");
+            printf("    The presented event log is spoofed, proxied, or from a different VM environment.\n");
             passthroughDetected = TRUE;
         }
     }
     else {
-        printf("[-] Warning: Skipping bootloader hash check (insufficient permissions / file locked).\n");
+        printf("[-] Warning: Skipping bootloader hash check (file inaccessible).\n");
     }
 
-    // 4. TPM Signed Quote Verification
-    printf("\n[*] Running TPM Signed Quote verification to detect proxying...\n");
-
+    printf("\n[*] Running TPM Signed Quote verification to detect proxying/emulation...\n");
     for (i = 0; i < 7; ++i) {
         memcpy(concatenatedGuestPCRs + offset_concat, reconstructedPCRs[selectedPCRs[i]], 32);
         offset_concat += 32;
@@ -432,7 +400,7 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
     if (calculate_sha256(concatenatedGuestPCRs, sizeof(concatenatedGuestPCRs), expectedPcrDigest)) {
         if (tpm_generate_quote_and_verify(hTbsContext, ekCert, expectedPcrDigest, &quoteVerified)) {
             if (!quoteVerified) {
-                printf("[!] Proxying anomaly detected. Reconstructed guest digest doesn't match signed TPM digest.\n");
+                printf("[!] Attestation Anomaly: Reconstructed guest digest does NOT match signed TPM quote.\n");
                 passthroughDetected = TRUE;
             }
             else {
@@ -440,7 +408,7 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
             }
         }
         else {
-            printf("[!] Failed to perform TPM Signed Quote verification. Flagging as untrusted.\n");
+            printf("[!] Failed to perform TPM Signed Quote verification.\n");
             passthroughDetected = TRUE;
         }
     }
@@ -449,19 +417,16 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         passthroughDetected = TRUE;
     }
 
-    // 5. Query and validate actual PCRs individually
     for (pcrIdx = 0; pcrIdx < 8; ++pcrIdx) {
         memset(actualPCR, 0, sizeof(actualPCR));
         actualPCRSize = 0;
         if (read_tpm_pcr(hTbsContext, pcrIdx, TPM_ALG_SHA256, actualPCR, &actualPCRSize)) {
             if (actualPCRSize != 32 || memcmp(actualPCR, reconstructedPCRs[pcrIdx], 32) != 0) {
                 mismatchingIdxs[mismatchingCount++] = pcrIdx;
-
                 printf("[!] Mismatch detected on PCR [%u].\n", pcrIdx);
-                printf("Reconstructed TCG: ");
+                printf("  Reconstructed: ");
                 for (int j = 0; j < 32; ++j) printf("%02x", reconstructedPCRs[pcrIdx][j]);
-                printf("\n");
-                printf("Hardware response: ");
+                printf("\n  Hardware Read: ");
                 for (uint32_t j = 0; j < actualPCRSize; ++j) printf("%02x", actualPCR[j]);
                 printf("\n");
 
@@ -470,17 +435,16 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
                 }
             }
             else {
-                printf("[+] PCR[%u] matches.\n", pcrIdx);
+                printf("[+] PCR[%u] matches hardware.\n", pcrIdx);
             }
         }
         else {
-            printf("[-] Failed to read actual PCR[%u]\n", pcrIdx);
+            printf("[-] Failed to read actual PCR[%u] from hardware.\n", pcrIdx);
         }
     }
 
-    // 6. Trace PCR mismatches if any occurred
     if (mismatchingCount > 0) {
-        printf("\n[*] Tracing...\n");
+        printf("\n[*] Tracing mismatched PCR logs...\n");
         for (i = 0; i < mismatchingCount; ++i) {
             uint32_t badPcrIdx = mismatchingIdxs[i];
             memset(actualPCR, 0, sizeof(actualPCR));
@@ -490,7 +454,6 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         }
     }
 
-    // Cleanup and exit
     for (i = 0; i < 24; ++i) {
         pcreventlist_free(&pcrEvents[i]);
     }

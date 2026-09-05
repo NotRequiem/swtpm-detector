@@ -1,4 +1,8 @@
 #include "tpm_verify.h"
+#include <wintrust.h>
+#include <softpub.h>
+
+#pragma comment(lib, "wintrust.lib")
 
 BOOL download_url_to_memory(const wchar_t* url, BYTE** outData, DWORD* outSize) {
     BOOL ok = FALSE;
@@ -13,12 +17,12 @@ BOOL download_url_to_memory(const wchar_t* url, BYTE** outData, DWORD* outSize) 
     DWORD dwFlags = 0;
     DWORD status = 0, statusSize = sizeof(status);
 
+    if (!url || !outData || !outSize) return FALSE;
     *outData = NULL;
     *outSize = 0;
 
     ZeroMemory(&uc, sizeof(uc));
     uc.dwStructSize = sizeof(uc);
-
     ZeroMemory(host, sizeof(host));
     ZeroMemory(path, sizeof(path));
     ZeroMemory(extra, sizeof(extra));
@@ -45,7 +49,7 @@ BOOL download_url_to_memory(const wchar_t* url, BYTE** outData, DWORD* outSize) 
         if (FAILED(StringCchCatW(fullPath, _countof(fullPath), extra))) goto cleanup;
     }
 
-    hSession = WinHttpOpen(L"TPMTrustCheck/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    hSession = WinHttpOpen(L"TPMTrustCheck/2.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) {
         print_last_error("WinHttpOpen");
@@ -67,8 +71,11 @@ BOOL download_url_to_memory(const wchar_t* url, BYTE** outData, DWORD* outSize) 
         goto cleanup;
     }
 
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-        WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+    // Follow HTTP redirects (e.g. fwlink -> cdn)
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
         print_last_error("WinHttpSendRequest");
         goto cleanup;
     }
@@ -81,7 +88,7 @@ BOOL download_url_to_memory(const wchar_t* url, BYTE** outData, DWORD* outSize) 
     if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
         if (status != 200) {
-            fprintf(stderr, "HTTP status %lu\n", (unsigned long)status);
+            fprintf(stderr, "HTTP status code: %lu\n", (unsigned long)status);
             goto cleanup;
         }
     }
@@ -125,4 +132,82 @@ cleanup:
     if (hConnect) WinHttpCloseHandle(hConnect);
     if (hSession) WinHttpCloseHandle(hSession);
     return ok;
+}
+
+static BOOL verify_file_authenticode(const wchar_t* filePath) {
+    WINTRUST_FILE_INFO fileInfo = { 0 };
+    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+    fileInfo.pcwszFilePath = filePath;
+
+    WINTRUST_DATA trustData = { 0 };
+    trustData.cbStruct = sizeof(WINTRUST_DATA);
+    trustData.dwUIChoice = WTD_UI_NONE;
+    trustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+    trustData.dwUnionChoice = WTD_CHOICE_FILE;
+    trustData.pFile = &fileInfo;
+    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    trustData.dwProvFlags = WTD_SAFER_FLAG;
+
+    GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    LONG status = WinVerifyTrust(NULL, &policyGuid, &trustData);
+
+    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &policyGuid, &trustData);
+
+    if (status != ERROR_SUCCESS) {
+        printf("[!] Authenticode verification failed with error: 0x%08X\n", (unsigned int)status);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+BOOL download_and_verify_trusted_tpm_cab(const wchar_t* url, BYTE** outData, DWORD* outSize) {
+    BYTE* downloaded = NULL;
+    DWORD downloadedSize = 0;
+    WCHAR tempPath[MAX_PATH];
+    WCHAR tempFile[MAX_PATH];
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    DWORD written = 0;
+
+    if (!download_url_to_memory(url, &downloaded, &downloadedSize)) {
+        return FALSE;
+    }
+
+    if (GetTempPathW(MAX_PATH, tempPath) == 0) {
+        free(downloaded);
+        return FALSE;
+    }
+
+    if (GetTempFileNameW(tempPath, L"TPM", 0, tempFile) == 0) {
+        free(downloaded);
+        return FALSE;
+    }
+
+    hFile = CreateFileW(tempFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        free(downloaded);
+        DeleteFileW(tempFile);
+        return FALSE;
+    }
+
+    if (!WriteFile(hFile, downloaded, downloadedSize, &written, NULL) || written != downloadedSize) {
+        CloseHandle(hFile);
+        DeleteFileW(tempFile);
+        free(downloaded);
+        return FALSE;
+    }
+    CloseHandle(hFile);
+
+    if (!verify_file_authenticode(tempFile)) {
+        printf("[!] Downloaded TrustedTpm.cab has an INVALID or missing Microsoft digital signature\n");
+        DeleteFileW(tempFile);
+        free(downloaded);
+        return FALSE;
+    }
+
+    DeleteFileW(tempFile);
+    *outData = downloaded;
+    *outSize = downloadedSize;
+    return TRUE;
 }

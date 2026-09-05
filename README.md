@@ -1,7 +1,7 @@
 # Spoofed TPM Detector
 
-> **`swtpm/vtpm detection`**
-- A pure software TPM will **never** possess a manufacturer-provisioned **private** EK whose corresponding certificate chains to a genuine certification authority.
+> **`swtpm detection`**
+- A software TPM will **never** possess a manufacturer-provisioned **private** EK whose corresponding certificate chains to a genuine certification authority.
 - Dumping a private EK is impossible without a vulnerability. Software can verify if you're in possession of the correct private EK by asking your TPM to decipher a random blob with the public EK.
 - Can't be bypassed when the detection is implemented properly.
 
@@ -26,6 +26,7 @@ In summary, a probe that asks *"Is this the same TPM instance that the OEM origi
 - The attacker configures the virtual machine's TCG Event Log to be empty or to represent a clean, unextended state.
 - The Quote check succeeds because the idle physical TPM signs its empty PCRs, which match the guest's simulated empty TCG log. This way, the attacker doesn't have to deal with complex TCG reconstruction because it doesn't need to perfectly emulate a real host TCG log into the guest.
 - However, because the secondary TPM is not the primary boot TPM of the host, it does not measure the host's boot process. Its PCRs 1–7 remain in their unextended initialization state. Therefore, the bypass is detected by ensuring that the PCRs selected for the quote are not default-initialized. Additionally, PCR 4 (EV_EFI_BOOT_SERVICES_APPLICATION) must match the Windows' bootloader hash.
+
 ---
 
 ## Build
@@ -44,27 +45,9 @@ gcc -O3 -municode main.c downloader.c cab_extractor.c crypto_helper.c tpm_info.c
 
 ---
 
-## Usage
-
-### Online Mode (Default)
-By default, the program downloads Microsoft's official trust database directly from their servers:
-
-```cmd
-tpm-verify.exe
-```
-
-### Offline Mode
-To run offline, put your own certificate cabinet file or the official [TrustedTpm.cab](https://go.microsoft.com/fwlink/?linkid=2097925) file manually and pass it to the validator:
-
-```cmd
-tpm-verify.exe --cab "C:\Path\To\TrustedTpm.cab"
-```
-
 ## Disclaimers
-This program is not designed to be tamper-resistant against memory modification or API call interception; it even allows you to put your own certificate database for testing purposes. Bypassing this program by directly hooking it is not a valid bypass, because a detector could leverage the same methods used here and verify your TPM using remote attestation.
+Bypassing this program by directly tamper (hook/modify memory, etc) with it is not a valid bypass; a detector could leverage the same methods used here and verify your TPM using remote attestation.
 
 TPMs without EKs exist, and there are legitimate purposes for regenerating them. Extra policy is needed. Developers using this idea may decide to block TPMs without EK or modified EKs, other people may decide to just flag/log it as a suspicious signal for future manual verification, others may decide to do extra checks in those cases, and others may decide to allow TPMs in those cases.
-
-The program probes that the guest has access to a trusted TPM-backed identity path.
 
 Attestation cannot be treated as a one-time gate. To prevent TOCTOU attacks, implement randomized periodic re-attestation loops.

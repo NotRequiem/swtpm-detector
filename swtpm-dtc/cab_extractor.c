@@ -160,32 +160,3 @@ BOOL extract_cab_from_memory(const BYTE* cabData, DWORD cabSize) {
     FDIDestroy(hfdi);
     return ok;
 }
-
-BOOL read_file_to_memory(const wchar_t* filePath, BYTE** outData, DWORD* outSize) {
-    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
-
-    DWORD size = GetFileSize(hFile, NULL);
-    if (size == INVALID_FILE_SIZE || size == 0) {
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    BYTE* buf = (BYTE*)malloc(size);
-    if (!buf) {
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    DWORD read = 0;
-    if (!ReadFile(hFile, buf, size, &read, NULL) || read != size) {
-        free(buf);
-        CloseHandle(hFile);
-        return FALSE;
-    }
-
-    CloseHandle(hFile);
-    *outData = buf;
-    *outSize = size;
-    return TRUE;
-}
