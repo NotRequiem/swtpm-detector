@@ -360,37 +360,6 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         memcpy(reconstructedPCRs[pcrIdx], currentPCR, 32);
     }
 
-    printf("\n[*] Verifying Windows Bootloader Authenticode Hash against TCG Event Log...\n");
-    BYTE calculatedBootHash[32];
-    DWORD calculatedBootHashSize = 0;
-
-    if (get_bootloader_authenticode_sha256(calculatedBootHash, &calculatedBootHashSize)) {
-        BOOL foundBootloaderInLog = FALSE;
-#define EV_EFI_BOOT_SERVICES_APPLICATION 0x80000003
-
-        for (uint32_t z = 0; z < pcrEvents[4].count; z++) {
-            const TrackedEvent* ev = &pcrEvents[4].items[z];
-            if (ev->eventType == EV_EFI_BOOT_SERVICES_APPLICATION) {
-                if (ev->digestSize == calculatedBootHashSize && memcmp(ev->digest, calculatedBootHash, calculatedBootHashSize) == 0) {
-                    foundBootloaderInLog = TRUE;
-                    break;
-                }
-            }
-        }
-
-        if (foundBootloaderInLog) {
-            printf("[+] Active bootloader signature matches PCR[4] event logs.\n");
-        }
-        else {
-            printf("[!] Verification Failure: Active bootloader hash was NOT found in PCR[4] logs.\n");
-            printf("    The presented event log is spoofed, proxied, or from a different VM environment.\n");
-            passthroughDetected = TRUE;
-        }
-    }
-    else {
-        printf("[-] Warning: Skipping bootloader hash check (file inaccessible).\n");
-    }
-
     printf("\n[*] Running TPM Signed Quote verification to detect proxying/emulation...\n");
     for (i = 0; i < 7; ++i) {
         memcpy(concatenatedGuestPCRs + offset_concat, reconstructedPCRs[selectedPCRs[i]], 32);
@@ -400,7 +369,7 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
     if (calculate_sha256(concatenatedGuestPCRs, sizeof(concatenatedGuestPCRs), expectedPcrDigest)) {
         if (tpm_generate_quote_and_verify(hTbsContext, ekCert, expectedPcrDigest, &quoteVerified)) {
             if (!quoteVerified) {
-                printf("[!] Attestation Anomaly: Reconstructed guest digest does NOT match signed TPM quote.\n");
+                printf("[!] Reconstructed guest digest does NOT match signed TPM quote.\n");
                 passthroughDetected = TRUE;
             }
             else {

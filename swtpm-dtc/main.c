@@ -290,7 +290,7 @@ int wmain() {
 
     printf("\n[*] Executing hardware quote and passthrough attestation...\n");
     if (!detect_tpm_passthrough(ekLeaf)) {
-        printf("\n[-] Result: Virtualized or spoofed TPM detected by attestation!\n");
+        printf("\n[-] Result: Virtualized or spoofed TPM detected by attestation.\n");
         ok = FALSE;
     }
     else {

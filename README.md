@@ -25,7 +25,7 @@ In summary, a probe that asks *"Is this the same TPM instance that the OEM origi
 - An attacker could attach a discrete physical TPM like a cheap usb-based TPM, and the hypervisor could proxy the guest's TPM commands to this idle secondary TPM.
 - The attacker configures the virtual machine's TCG Event Log to be empty or to represent a clean, unextended state.
 - The Quote check succeeds because the idle physical TPM signs its empty PCRs, which match the guest's simulated empty TCG log. This way, the attacker doesn't have to deal with complex TCG reconstruction because it doesn't need to perfectly emulate a real host TCG log into the guest.
-- However, because the secondary TPM is not the primary boot TPM of the host, it does not measure the host's boot process. Its PCRs 1–7 remain in their unextended initialization state. Therefore, the bypass is detected by ensuring that the PCRs selected for the quote are not default-initialized. Additionally, PCR 4 (EV_EFI_BOOT_SERVICES_APPLICATION) must match the Windows' bootloader hash.
+- However, because the secondary TPM is not the primary boot TPM of the host, it does not measure the host's boot process. Its PCRs 1–7 remain in their unextended initialization state. Therefore, the bypass is detected by ensuring that the PCRs selected for the quote are not default-initialized.
 
 ---
 
