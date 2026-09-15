@@ -1294,6 +1294,8 @@ static BOOL verify_quote_signature(const BYTE* attestBytes, UINT16 attestSize, c
 }
 
 static BOOL parse_and_verify_attest_structure(const BYTE* attestBytes, UINT16 attestSize, const BYTE* expectedNonce, UINT16 expectedNonceSize, BYTE* outPcrDigest, UINT16* outPcrDigestSize) {
+    if (!attestBytes || attestSize < 37) return FALSE;
+
     buf_parser p;
     init_parser(&p, attestBytes, attestSize);
 
@@ -1301,14 +1303,17 @@ static BOOL parse_and_verify_attest_structure(const BYTE* attestBytes, UINT16 at
     if (read_16(&p) != 0x8018) return FALSE;     // TPM_ST_ATTEST_QUOTE
 
     UINT16 qualifiedSignerSize = read_16(&p);
+    if (p.read_pos + qualifiedSignerSize > attestSize) return FALSE;
     p.read_pos += qualifiedSignerSize;
 
     UINT16 extraDataSize = read_16(&p);
+    if (p.read_pos + extraDataSize > attestSize) return FALSE;
     if (extraDataSize != expectedNonceSize || memcmp(p.buf + p.read_pos, expectedNonce, extraDataSize) != 0) {
         return FALSE;
     }
     p.read_pos += extraDataSize;
 
+    if (p.read_pos + 17 + 8 > attestSize) return FALSE;
     p.read_pos += 17; // clockInfo
     p.read_pos += 8;  // firmwareVersion
 

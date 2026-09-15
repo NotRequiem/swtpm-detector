@@ -288,6 +288,14 @@ int wmain() {
 
     printf("\n[+] Result: EK certificate successfully verified against Microsoft TrustedTpm CAB.\n");
 
+    printf("\n[*] Running local TPM Proof-of-Possession challenge (ActivateCredential)...\n");
+    if (!perform_local_tpm_pop_challenge(ekLeaf)) {
+        printf("[-] Result: Local TPM failed Proof-of-Possession challenge (private EK not present).\n");
+        ok = FALSE;
+        goto cleanup;
+    }
+    printf("[+] Result: Local TPM possesses private EK matching verified certificate.\n");
+
     printf("\n[*] Executing hardware quote and passthrough attestation...\n");
     if (!detect_tpm_passthrough(ekLeaf)) {
         printf("\n[-] Result: Virtualized or spoofed TPM detected by attestation.\n");
@@ -308,7 +316,7 @@ cleanup:
     free_filelist(&g_extracted);
     free(cab);
 
-    printf("[*] Running version: v3.0\n");
+    printf("[*] Running version: v3.1\n");
     system("pause");
     return ok ? 0 : 1;
 }

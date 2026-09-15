@@ -150,16 +150,36 @@ static BOOL verify_file_authenticode(const wchar_t* filePath) {
 
     GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
     LONG status = WinVerifyTrust(NULL, &policyGuid, &trustData);
+    BOOL verified = FALSE;
+
+    if (status == ERROR_SUCCESS) {
+        CRYPT_PROVIDER_DATA* pProvData = WTHelperProvDataFromStateData(trustData.hWVTStateData);
+        if (pProvData) {
+            CRYPT_PROVIDER_SGNR* pSigner = WTHelperGetProvSignerFromChain(pProvData, 0, FALSE, 0);
+            if (pSigner) {
+                CRYPT_PROVIDER_CERT* pCert = WTHelperGetProvCertFromChain(pSigner, 0);
+                if (pCert && pCert->pCert) {
+                    WCHAR subject[512] = { 0 };
+                    if (CertGetNameStringW(pCert->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, subject, _countof(subject)) > 0) {
+                        if (wcsstr(subject, L"Microsoft Corporation") != NULL) {
+                            verified = TRUE;
+                        }
+                        else {
+                            wprintf(L"[!] CAB signed by untrusted publisher: %ls\n", subject);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else {
+        printf("[!] Authenticode verification failed with error: 0x%08X\n", (unsigned int)status);
+    }
 
     trustData.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(NULL, &policyGuid, &trustData);
 
-    if (status != ERROR_SUCCESS) {
-        printf("[!] Authenticode verification failed with error: 0x%08X\n", (unsigned int)status);
-        return FALSE;
-    }
-
-    return TRUE;
+    return verified;
 }
 
 BOOL download_and_verify_trusted_tpm_cab(const wchar_t* url, BYTE** outData, DWORD* outSize) {

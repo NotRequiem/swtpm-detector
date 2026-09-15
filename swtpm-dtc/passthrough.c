@@ -259,8 +259,11 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
     printf("[+] Downloaded TCG Log (%lu bytes).\n", (unsigned long)logSize);
 
     algsizemap_init(&algToSize);
-    algsizemap_set(&algToSize, 0x0004, 20); 
-    algsizemap_set(&algToSize, TPM_ALG_SHA256, 32);
+    algsizemap_set(&algToSize, 0x0004, 20);         // TPM_ALG_SHA1
+    algsizemap_set(&algToSize, TPM_ALG_SHA256, 32); // TPM_ALG_SHA256
+    algsizemap_set(&algToSize, 0x000C, 48);         // TPM_ALG_SHA384
+    algsizemap_set(&algToSize, 0x000D, 64);         // TPM_ALG_SHA512
+    algsizemap_set(&algToSize, 0x0012, 32);         // TPM_ALG_SM3_256
 
     for (i = 0; i < 24; ++i) {
         pcreventlist_init(&pcrEvents[i]);
@@ -274,10 +277,18 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
             const uint8_t* firstEventData = logBuffer + offset;
             offset += firstHeader->EventSize;
 
-            if (firstHeader->EventType == 0x03 && firstHeader->EventSize >= 24) {
+            // [0..15]  Signature: "Spec ID Event03\0"
+            // [16..19] PlatformClass: UINT32
+            // [20]     SpecVersionMinor: UINT8
+            // [21]     SpecVersionMajor: UINT8
+            // [22]     SpecErrata: UINT8
+            // [23]     UintNSize: UINT8
+            // [24..27] NumberOfAlgorithms: UINT32
+            // [28..]   DigestSizes: array of (UINT16 algId, UINT16 digestSize)
+            if (firstHeader->EventType == 0x03 && firstHeader->EventSize >= 28) {
                 if (memcmp(firstEventData, "Spec ID Event03", 15) == 0) {
-                    uint8_t numAlgs = *(const uint8_t*)(firstEventData + 23);
-                    uint32_t algOffset = 24;
+                    uint32_t numAlgs = *(const uint32_t*)(firstEventData + 24);
+                    uint32_t algOffset = 28;
                     for (uint32_t j = 0; j < numAlgs; ++j) {
                         if (algOffset + 4 > firstHeader->EventSize) break;
                         uint16_t algId = *(const uint16_t*)(firstEventData + algOffset);
@@ -334,7 +345,7 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         uint32_t eventSize = *(const uint32_t*)(logBuffer + offset);
         offset += 4;
 
-        if (offset + eventSize > logSize) break;
+        if (eventSize > logSize - offset) break;
         offset += eventSize;
 
         for (uint32_t j = 0; j < tempDigestCount; ++j) {
@@ -385,7 +396,13 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         printf("[-] Failed to calculate expected guest PCR digest.\n");
         passthroughDetected = TRUE;
     }
-
+    
+    BYTE allZeroCheck[224] = { 0 };
+    if (memcmp(concatenatedGuestPCRs, allZeroCheck, sizeof(allZeroCheck)) == 0) {
+        printf("[!] Warning: Reconstructed guest PCR bank is completely zero/unextended.\n");
+        passthroughDetected = TRUE;
+    }
+    
     for (pcrIdx = 0; pcrIdx < 8; ++pcrIdx) {
         memset(actualPCR, 0, sizeof(actualPCR));
         actualPCRSize = 0;
@@ -409,6 +426,10 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ekCert) {
         }
         else {
             printf("[-] Failed to read actual PCR[%u] from hardware.\n", pcrIdx);
+            // a hypervisor dropping TPM_CC_PCR_Read?
+            if (pcrIdx != 0) {
+                passthroughDetected = TRUE;
+            }
         }
     }
 
