@@ -1,8 +1,4 @@
-#include "tpm_verify.h"
-#include <wincrypt.h>
-#include <bcrypt.h>
-#include <strsafe.h>
-#include <ctype.h>
+#include "tpm.h"
 
 BOOL ends_with_i(const char* s, const char* suffix) {
     size_t ls, lt;
@@ -14,6 +10,7 @@ BOOL ends_with_i(const char* s, const char* suffix) {
 }
 
 const char* basename_a(const char* path) {
+    if (!path) return "";
     const char* p1 = strrchr(path, '\\');
     const char* p2 = strrchr(path, '/');
     const char* p = (p1 && p2) ? (p1 > p2 ? p1 : p2) : (p1 ? p1 : p2);
@@ -21,17 +18,17 @@ const char* basename_a(const char* path) {
 }
 
 const char* ext_a(const char* path) {
+    if (!path) return "";
     const char* b = basename_a(path);
     const char* dot = strrchr(b, '.');
     return dot ? dot + 1 : "";
 }
 
 BOOL is_cert_file_name(const char* path) {
+    if (!path) return FALSE;
     const char* e = ext_a(path);
-    return (_stricmp(e, "cer") == 0) ||
-        (_stricmp(e, "crt") == 0) ||
-        (_stricmp(e, "der") == 0) ||
-        (_stricmp(e, "pem") == 0);
+    return (_stricmp(e, "cer") == 0) || (_stricmp(e, "crt") == 0) ||
+        (_stricmp(e, "der") == 0) || (_stricmp(e, "pem") == 0);
 }
 
 void free_filebuf(FILEBUF* f) {
@@ -43,17 +40,20 @@ void free_filebuf(FILEBUF* f) {
 
 void free_filelist(FILELIST* list) {
     if (!list) return;
-    for (size_t i = 0; i < list->count; ++i) {
-        free_filebuf(&list->items[i]);
+    if (list->items) {
+        for (size_t i = 0; i < list->count; ++i) {
+            free_filebuf(&list->items[i]);
+        }
+        free(list->items);
     }
-    free(list->items);
     memset(list, 0, sizeof(*list));
 }
 
 BOOL filelist_push(FILELIST* list, const char* name, const BYTE* data, DWORD size) {
     if (!list || !name || (!data && size != 0)) return FALSE;
 
-    if (list->count == list->cap) {
+    if (list->count >= list->cap) {
+        if (list->cap > (SIZE_MAX / 2) / sizeof(FILEBUF)) return FALSE;
         size_t newcap = list->cap ? list->cap * 2 : 32;
         FILEBUF* p = (FILEBUF*)realloc(list->items, newcap * sizeof(FILEBUF));
         if (!p) return FALSE;
@@ -63,53 +63,66 @@ BOOL filelist_push(FILELIST* list, const char* name, const BYTE* data, DWORD siz
     }
 
     FILEBUF* out = &list->items[list->count];
-    memset(out, 0, sizeof(*out));
     out->name = _strdup(name);
     if (!out->name) return FALSE;
 
     out->data = (BYTE*)malloc(size ? size : 1);
     if (!out->data) {
         free(out->name);
-        memset(out, 0, sizeof(*out));
+        out->name = NULL;
         return FALSE;
     }
 
-    if (size) memcpy(out->data, data, size);
+    if (size && data) {
+        memcpy(out->data, data, size);
+    }
     out->size = size;
-    out->cap = size;
+    out->cap = size ? size : 1;
     list->count++;
     return TRUE;
 }
 
 void free_wstringlist(WSTRINGLIST* list) {
     if (!list) return;
-    for (size_t i = 0; i < list->count; ++i) free(list->items[i]);
-    free(list->items);
+    if (list->items) {
+        for (size_t i = 0; i < list->count; ++i) {
+            free(list->items[i]);
+        }
+        free(list->items);
+    }
     memset(list, 0, sizeof(*list));
 }
 
 BOOL wstringlist_contains(const WSTRINGLIST* list, const WCHAR* s) {
-    if (!list || !s) return FALSE;
+    if (!list || !s || !list->items) return FALSE;
     for (size_t i = 0; i < list->count; ++i) {
-        if (_wcsicmp(list->items[i], s) == 0) return TRUE;
+        if (list->items[i] && _wcsicmp(list->items[i], s) == 0) return TRUE;
     }
     return FALSE;
 }
 
 BOOL wstringlist_push(WSTRINGLIST* list, const WCHAR* s) {
-    WCHAR* copy;
-    WCHAR** p;
     if (!list || !s || !s[0]) return FALSE;
     if (wstringlist_contains(list, s)) return TRUE;
-    if (list->count == list->cap) {
+
+    WCHAR* copy = _wcsdup(s);
+    if (!copy) return FALSE;
+
+    if (list->count >= list->cap) {
+        if (list->cap > (SIZE_MAX / 2) / sizeof(WCHAR*)) {
+            free(copy);
+            return FALSE;
+        }
         size_t newcap = list->cap ? list->cap * 2 : 8;
-        p = (WCHAR**)realloc(list->items, newcap * sizeof(WCHAR*));
-        if (!p) return FALSE;
+        WCHAR** p = (WCHAR**)realloc(list->items, newcap * sizeof(WCHAR*));
+        if (!p) {
+            free(copy);
+            return FALSE;
+        }
         list->items = p;
         list->cap = newcap;
     }
-    copy = _wcsdup(s);
-    if (!copy) return FALSE;
+
     list->items[list->count++] = copy;
     return TRUE;
 }
@@ -119,14 +132,16 @@ BOOL url_is_http(const WCHAR* url) {
 }
 
 BOOL extract_aia_ca_issuers(PCCERT_CONTEXT cert, WSTRINGLIST* urls) {
-    PCCERT_EXTENSION ext;
+    if (!cert || !cert->pCertInfo || !urls) return FALSE;
+
+    PCERT_EXTENSION ext = CertFindExtension(szOID_AUTHORITY_INFO_ACCESS,
+        cert->pCertInfo->cExtension,
+        cert->pCertInfo->rgExtension);
+    if (!ext) return TRUE;
+    if (!ext->Value.pbData || ext->Value.cbData == 0) return TRUE;
+
     DWORD cb = 0;
     PCERT_AUTHORITY_INFO_ACCESS aia = NULL;
-
-    if (!cert || !urls) return FALSE;
-    ext = CertFindExtension(szOID_AUTHORITY_INFO_ACCESS, cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension);
-    if (!ext) return TRUE;
-
     if (!CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
         X509_AUTHORITY_INFO_ACCESS,
         ext->Value.pbData,
@@ -138,150 +153,112 @@ BOOL extract_aia_ca_issuers(PCCERT_CONTEXT cert, WSTRINGLIST* urls) {
         return FALSE;
     }
 
-    for (DWORD i = 0; i < aia->cAccDescr; ++i) {
-        CERT_ACCESS_DESCRIPTION* ad = &aia->rgAccDescr[i];
-        if (ad->pszAccessMethod && strcmp(ad->pszAccessMethod, szOID_PKIX_CA_ISSUERS) == 0) {
-            if (ad->AccessLocation.dwAltNameChoice == CERT_ALT_NAME_URL && ad->AccessLocation.pwszURL) {
+    if (aia) {
+        for (DWORD i = 0; i < aia->cAccDescr; ++i) {
+            CERT_ACCESS_DESCRIPTION* ad = &aia->rgAccDescr[i];
+            if (ad->pszAccessMethod &&
+                strcmp(ad->pszAccessMethod, szOID_PKIX_CA_ISSUERS) == 0 &&
+                ad->AccessLocation.dwAltNameChoice == CERT_ALT_NAME_URL &&
+                ad->AccessLocation.pwszURL) {
                 if (url_is_http(ad->AccessLocation.pwszURL)) {
                     wstringlist_push(urls, ad->AccessLocation.pwszURL);
                 }
             }
         }
+        LocalFree(aia);
     }
-
-    LocalFree(aia);
     return TRUE;
 }
 
 void print_last_error(const char* what) {
     DWORD e = GetLastError();
-    char* msg = NULL;
-    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        NULL, e, 0, (LPSTR)&msg, 0, NULL);
-    fprintf(stderr, "%s failed: %lu%s%s\n", what, (unsigned long)e, msg ? ": " : "", msg ? msg : "");
-    if (msg) LocalFree(msg);
-}
-
-void print_tbs_result(const char* what, TBS_RESULT r) {
-    fprintf(stderr, "%s failed: 0x%08lx\n", what, (unsigned long)r);
-}
-
-void print_ntstatus(const char* what, SECURITY_STATUS s) {
-    fprintf(stderr, "%s failed: 0x%08lx\n", what, (unsigned long)s);
-}
-
-void print_ascii4(const char* label, uint32_t val) {
-    char s[5] = { 0 };
-    s[0] = (char)((val >> 24) & 0xFF);
-    s[1] = (char)((val >> 16) & 0xFF);
-    s[2] = (char)((val >> 8) & 0xFF);
-    s[3] = (char)(val & 0xFF);
-    s[4] = '\0';
-    printf("%s: %lu (ASCII '%s')\n", label, (unsigned long)val, s);
-}
-
-void print_utf8_or_unknown(const char* label, const char* s) {
-    printf("%s: %s\n", label, (s && s[0]) ? s : "(unknown)");
+    fprintf(stderr, "%s failed: %lu\n", what ? what : "Operation", (unsigned long)e);
 }
 
 BOOL is_pem_data(const BYTE* data, DWORD size) {
     const char prefix[] = "-----BEGIN";
-    return data && size >= sizeof(prefix) - 1 && memcmp(data, prefix, sizeof(prefix) - 1) == 0;
+    DWORD offset = 0;
+    if (!data || size < sizeof(prefix) - 1) return FALSE;
+    if (size >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) {
+        offset = 3;
+    }
+    while (offset < size && (data[offset] == ' ' || data[offset] == '\r' ||
+        data[offset] == '\n' || data[offset] == '\t')) {
+        offset++;
+    }
+    if ((unsigned long long)(size) - offset < sizeof(prefix) - 1) return FALSE;
+    return memcmp(data + offset, prefix, sizeof(prefix) - 1) == 0;
 }
 
 BOOL base64_decode_alloc(const char* s, BYTE** out, DWORD* outSize) {
-    DWORD needed = 0;
-    BYTE* buf = NULL;
+    if (!s || !out || !outSize) return FALSE;
     *out = NULL;
     *outSize = 0;
 
-    if (!CryptStringToBinaryA(s, 0, CRYPT_STRING_BASE64HEADER, NULL, &needed, NULL, NULL) &&
-        !CryptStringToBinaryA(s, 0, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &needed, NULL, NULL)) {
+    DWORD needed = 0;
+    if (!CryptStringToBinaryA(s, 0, CRYPT_STRING_BASE64_ANY, NULL, &needed, NULL, NULL) || needed == 0) {
         return FALSE;
     }
+    *out = (BYTE*)malloc(needed);
+    if (!*out) return FALSE;
 
-    buf = (BYTE*)malloc(needed ? needed : 1);
-    if (!buf) return FALSE;
-
-    if (!CryptStringToBinaryA(s, 0, CRYPT_STRING_BASE64HEADER, buf, &needed, NULL, NULL) &&
-        !CryptStringToBinaryA(s, 0, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, buf, &needed, NULL, NULL)) {
-        free(buf);
+    if (!CryptStringToBinaryA(s, 0, CRYPT_STRING_BASE64_ANY, *out, &needed, NULL, NULL)) {
+        free(*out);
+        *out = NULL;
         return FALSE;
     }
-
-    *out = buf;
     *outSize = needed;
     return TRUE;
 }
 
 BOOL parse_certs_from_extracted_files(HCERTSTORE* outStore) {
-    HCERTSTORE store = NULL;
+    if (!outStore) return FALSE;
     *outStore = NULL;
 
-    store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
-    if (!store) {
-        print_last_error("CertOpenStore(memory)");
-        return FALSE;
-    }
+    HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+    if (!store) return FALSE;
 
-    for (size_t i = 0; i < g_extracted.count; ++i) {
-        FILEBUF* f = &g_extracted.items[i];
-        BYTE* der = NULL;
-        DWORD derSize = 0;
-        BOOL decoded = FALSE;
-        PCCERT_CONTEXT cc = NULL;
+    if (g_extracted.items) {
+        for (size_t i = 0; i < g_extracted.count; ++i) {
+            FILEBUF* f = &g_extracted.items[i];
+            if (!f || !f->data || f->size == 0) continue;
 
-        if (is_pem_data(f->data, f->size)) {
-            char* tmp = (char*)malloc((size_t)(f->size) + 1);
-            if (!tmp) continue;
-            memcpy(tmp, f->data, f->size);
-            tmp[f->size] = '\0';
-            decoded = base64_decode_alloc(tmp, &der, &derSize);
-            free(tmp);
-        }
-        else {
-            der = (BYTE*)malloc(f->size ? f->size : 1);
-            if (der) {
-                if (f->size) memcpy(der, f->data, f->size);
-                derSize = f->size;
-                decoded = TRUE;
+            PCCERT_CONTEXT cc = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, f->data, f->size);
+            if (!cc && is_pem_data(f->data, f->size)) {
+                DWORD derSize = 0;
+                if (CryptStringToBinaryA((LPCSTR)f->data, f->size, CRYPT_STRING_BASE64HEADER, NULL, &derSize, NULL, NULL) && derSize > 0) {
+                    BYTE* derBuf = (BYTE*)malloc(derSize);
+                    if (derBuf) {
+                        if (CryptStringToBinaryA((LPCSTR)f->data, f->size, CRYPT_STRING_BASE64HEADER, derBuf, &derSize, NULL, NULL)) {
+                            cc = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, derBuf, derSize);
+                        }
+                        free(derBuf);
+                    }
+                }
+            }
+
+            if (cc) {
+                CertAddCertificateContextToStore(store, cc, CERT_STORE_ADD_ALWAYS, NULL);
+                CertFreeCertificateContext(cc);
             }
         }
-
-        if (!decoded || !der || derSize == 0) {
-            free(der);
-            continue;
-        }
-
-        cc = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, der, derSize);
-        if (!cc) {
-            free(der);
-            continue;
-        }
-
-        if (!CertAddCertificateContextToStore(store, cc, CERT_STORE_ADD_ALWAYS, NULL)) {
-            CertFreeCertificateContext(cc);
-            free(der);
-            continue;
-        }
-
-        CertFreeCertificateContext(cc);
-        free(der);
     }
-
     *outStore = store;
     return TRUE;
 }
 
 BOOL cert_equals(PCCERT_CONTEXT a, PCCERT_CONTEXT b) {
     if (!a || !b) return FALSE;
+    if (a == b) return TRUE;
     if (a->cbCertEncoded != b->cbCertEncoded) return FALSE;
+    if (a->cbCertEncoded == 0) return TRUE;
+    if (!a->pbCertEncoded || !b->pbCertEncoded) return FALSE;
     return memcmp(a->pbCertEncoded, b->pbCertEncoded, a->cbCertEncoded) == 0;
 }
 
 BOOL store_contains_cert_exact(HCERTSTORE store, PCCERT_CONTEXT cert) {
-    PCCERT_CONTEXT c = NULL;
     if (!store || !cert) return FALSE;
+    PCCERT_CONTEXT c = NULL;
     while ((c = CertEnumCertificatesInStore(store, c)) != NULL) {
         if (cert_equals(c, cert)) {
             CertFreeCertificateContext(c);
@@ -291,59 +268,95 @@ BOOL store_contains_cert_exact(HCERTSTORE store, PCCERT_CONTEXT cert) {
     return FALSE;
 }
 
+BOOL cert_signature_validates_against_issuer(PCCERT_CONTEXT subject, PCCERT_CONTEXT issuer) {
+    if (!subject || !issuer) return FALSE;
+    return CryptVerifyCertificateSignatureEx(
+        0,
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT,
+        (void*)subject,
+        CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT,
+        (void*)issuer,
+        0,
+        NULL);
+}
+
 BOOL cert_is_self_signed(PCCERT_CONTEXT cert) {
-    if (!cert) return FALSE;
-    if (!CertCompareCertificateName(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        &cert->pCertInfo->Subject,
-        &cert->pCertInfo->Issuer)) {
-        return FALSE;
-    }
-    return cert_signature_validates_against_issuer(cert, cert);
+    return (cert && cert->pCertInfo &&
+        CertCompareCertificateName(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            &cert->pCertInfo->Subject,
+            &cert->pCertInfo->Issuer) &&
+        cert_signature_validates_against_issuer(cert, cert));
 }
 
 BOOL cert_is_trusted_root(PCCERT_CONTEXT cert, HCERTSTORE hRoots) {
-    if (!cert || !hRoots) return FALSE;
-    return store_contains_cert_exact(hRoots, cert);
+    return (cert && hRoots && store_contains_cert_exact(hRoots, cert));
 }
 
 BOOL blob_equals(const CRYPT_DATA_BLOB* a, const CRYPT_DATA_BLOB* b) {
     if (!a || !b) return FALSE;
-    return a->cbData == b->cbData && a->cbData > 0 && memcmp(a->pbData, b->pbData, a->cbData) == 0;
+    if (a->cbData != b->cbData) return FALSE;
+    if (a->cbData == 0) return TRUE;
+    if (!a->pbData || !b->pbData) return FALSE;
+    return memcmp(a->pbData, b->pbData, a->cbData) == 0;
 }
 
 BOOL get_cert_subject_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out) {
-    DWORD cb = 0;
-    BYTE* pb = NULL;
-    if (!cert || !out) return FALSE;
-    ZeroMemory(out, sizeof(*out));
+    if (!out) return FALSE;
+    out->pbData = NULL;
+    out->cbData = 0;
+    if (!cert || !cert->pCertInfo) return FALSE;
 
-    if (CertGetCertificateContextProperty(cert, CERT_KEY_IDENTIFIER_PROP_ID, NULL, &cb) && cb) {
-        pb = (BYTE*)malloc(cb);
-        if (!pb) return FALSE;
-        if (CertGetCertificateContextProperty(cert, CERT_KEY_IDENTIFIER_PROP_ID, pb, &cb)) {
-            out->pbData = pb;
-            out->cbData = cb;
-            return TRUE;
+    PCERT_EXTENSION ext = CertFindExtension(szOID_SUBJECT_KEY_IDENTIFIER,
+        cert->pCertInfo->cExtension,
+        cert->pCertInfo->rgExtension);
+    if (ext && ext->Value.pbData && ext->Value.cbData > 0) {
+        PCRYPT_DATA_BLOB skiBlob = NULL;
+        DWORD cb = 0;
+        if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            szOID_SUBJECT_KEY_IDENTIFIER,
+            ext->Value.pbData,
+            ext->Value.cbData,
+            CRYPT_DECODE_ALLOC_FLAG,
+            NULL,
+            &skiBlob,
+            &cb)) {
+            if (skiBlob && skiBlob->cbData > 0 && skiBlob->pbData) {
+                out->pbData = (BYTE*)malloc(skiBlob->cbData);
+                if (out->pbData) {
+                    memcpy(out->pbData, skiBlob->pbData, skiBlob->cbData);
+                    out->cbData = skiBlob->cbData;
+                    LocalFree(skiBlob);
+                    return TRUE;
+                }
+            }
+            if (skiBlob) LocalFree(skiBlob);
         }
-        free(pb);
-        return FALSE;
     }
     return FALSE;
 }
 
 BOOL get_cert_authority_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out) {
-    PCCERT_EXTENSION ext = NULL;
-    DWORD cb = 0;
+    if (!out) return FALSE;
+    out->pbData = NULL;
+    out->cbData = 0;
+    if (!cert || !cert->pCertInfo) return FALSE;
 
-    if (!cert || !out) return FALSE;
-    ZeroMemory(out, sizeof(*out));
-
-    ext = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER2, cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension);
-    if (ext) {
+    PCERT_EXTENSION ext = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER2,
+        cert->pCertInfo->cExtension,
+        cert->pCertInfo->rgExtension);
+    if (ext && ext->Value.pbData && ext->Value.cbData > 0) {
         PCERT_AUTHORITY_KEY_ID2_INFO aki2 = NULL;
-        if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, X509_AUTHORITY_KEY_ID2,
-            ext->Value.pbData, ext->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &aki2, &cb)) {
-            if (aki2->KeyId.cbData && aki2->KeyId.pbData) {
+        DWORD cb = 0;
+        if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            X509_AUTHORITY_KEY_ID2,
+            ext->Value.pbData,
+            ext->Value.cbData,
+            CRYPT_DECODE_ALLOC_FLAG,
+            NULL,
+            &aki2,
+            &cb)) {
+            if (aki2 && aki2->KeyId.cbData > 0 && aki2->KeyId.pbData) {
                 out->pbData = (BYTE*)malloc(aki2->KeyId.cbData);
                 if (out->pbData) {
                     memcpy(out->pbData, aki2->KeyId.pbData, aki2->KeyId.cbData);
@@ -352,135 +365,106 @@ BOOL get_cert_authority_key_identifier(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out
                     return TRUE;
                 }
             }
-            LocalFree(aki2);
-        }
-        return FALSE;
-    }
-
-    ext = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER, cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension);
-    if (ext) {
-        PCERT_AUTHORITY_KEY_ID_INFO aki1 = NULL;
-        if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, X509_AUTHORITY_KEY_ID,
-            ext->Value.pbData, ext->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &aki1, &cb)) {
-            if (aki1->KeyId.cbData && aki1->KeyId.pbData) {
-                out->pbData = (BYTE*)malloc(aki1->KeyId.cbData);
-                if (out->pbData) {
-                    memcpy(out->pbData, aki1->KeyId.pbData, aki1->KeyId.cbData);
-                    out->cbData = aki1->KeyId.cbData;
-                    LocalFree(aki1);
-                    return TRUE;
-                }
-            }
-            LocalFree(aki1);
+            if (aki2) LocalFree(aki2);
         }
     }
     return FALSE;
 }
 
 PCCERT_CONTEXT find_valid_issuer_in_store(HCERTSTORE store, PCCERT_CONTEXT subject) {
-    PCCERT_CONTEXT c = NULL;
-    CRYPT_DATA_BLOB subjectAki = { 0 };
-    BOOL haveAki = FALSE;
-
     if (!store || !subject) return NULL;
-    haveAki = get_cert_authority_key_identifier(subject, &subjectAki);
+    PCCERT_CONTEXT c = NULL;
 
-    c = NULL;
-    while ((c = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_ISSUER_OF, subject, c)) != NULL) {
+    while ((c = CertFindCertificateInStore(store,
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        0,
+        CERT_FIND_ISSUER_OF,
+        subject,
+        c)) != NULL) {
         if (cert_signature_validates_against_issuer(subject, c)) {
-            if (haveAki) free(subjectAki.pbData);
-            PCCERT_CONTEXT duplicated = CertDuplicateCertificateContext(c);
-            CertFreeCertificateContext(c);
-            return duplicated;
-        }
-    }
-
-    if (haveAki) {
-        c = NULL;
-        while ((c = CertEnumCertificatesInStore(store, c)) != NULL) {
-            CRYPT_DATA_BLOB ski = { 0 };
-            BOOL matched = FALSE;
-            if (get_cert_subject_key_identifier(c, &ski)) {
-                matched = blob_equals(&subjectAki, &ski);
-                free(ski.pbData);
-            }
-            if (matched && cert_signature_validates_against_issuer(subject, c)) {
-                free(subjectAki.pbData);
-                PCCERT_CONTEXT duplicated = CertDuplicateCertificateContext(c);
-                CertFreeCertificateContext(c);
-                return duplicated;
-            }
-        }
-        free(subjectAki.pbData);
-    }
-
-    c = NULL;
-    while ((c = CertEnumCertificatesInStore(store, c)) != NULL) {
-        if (cert_signature_validates_against_issuer(subject, c)) {
-            PCCERT_CONTEXT duplicated = CertDuplicateCertificateContext(c);
-            CertFreeCertificateContext(c);
-            return duplicated;
+            return c;
         }
     }
     return NULL;
 }
 
-BOOL build_cab_trust_stores(HCERTSTORE hCabStore, HCERTSTORE* outRoots, HCERTSTORE* outIntermediates,
-    DWORD* outRootCount, DWORD* outIntermediateCount) {
-    PCCERT_CONTEXT c = NULL;
-    HCERTSTORE roots = NULL, inters = NULL;
-    DWORD rootCount = 0, intermediateCount = 0;
+BOOL build_cab_trust_stores(HCERTSTORE hCabStore,
+    HCERTSTORE* outRoots,
+    HCERTSTORE* outIntermediates,
+    DWORD* outRootCount,
+    DWORD* outIntermediateCount) {
+    if (outRoots) *outRoots = NULL;
+    if (outIntermediates) *outIntermediates = NULL;
+    if (outRootCount) *outRootCount = 0;
+    if (outIntermediateCount) *outIntermediateCount = 0;
 
-    roots = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
-    inters = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
-    if (!roots || !inters) {
-        if (roots) CertCloseStore(roots, 0);
-        if (inters) CertCloseStore(inters, 0);
-        return FALSE;
+    if (!hCabStore) return FALSE;
+
+    HCERTSTORE roots = NULL;
+    if (outRoots || outRootCount) {
+        roots = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+        if (!roots) return FALSE;
     }
+
+    HCERTSTORE intermediates = NULL;
+    if (outIntermediates || outIntermediateCount) {
+        intermediates = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
+        if (!intermediates) {
+            if (roots) CertCloseStore(roots, 0);
+            return FALSE;
+        }
+    }
+
+    DWORD rootCount = 0;
+    DWORD intermediateCount = 0;
+    PCCERT_CONTEXT c = NULL;
 
     while ((c = CertEnumCertificatesInStore(hCabStore, c)) != NULL) {
         if (cert_is_self_signed(c)) {
-            if (CertAddCertificateContextToStore(roots, c, CERT_STORE_ADD_ALWAYS, NULL)) rootCount++;
+            if (roots) {
+                if (CertAddCertificateContextToStore(roots, c, CERT_STORE_ADD_ALWAYS, NULL)) {
+                    rootCount++;
+                }
+            }
         }
         else {
-            if (CertAddCertificateContextToStore(inters, c, CERT_STORE_ADD_ALWAYS, NULL)) intermediateCount++;
+            if (intermediates) {
+                if (CertAddCertificateContextToStore(intermediates, c, CERT_STORE_ADD_ALWAYS, NULL)) {
+                    intermediateCount++;
+                }
+            }
         }
     }
 
-    if (outRoots) *outRoots = roots; else CertCloseStore(roots, 0);
-    if (outIntermediates) *outIntermediates = inters; else CertCloseStore(inters, 0);
+    if (outRoots) {
+        *outRoots = roots;
+    }
+    else if (roots) {
+        CertCloseStore(roots, 0);
+    }
+
+    if (outIntermediates) {
+        *outIntermediates = intermediates;
+    }
+    else if (intermediates) {
+        CertCloseStore(intermediates, 0);
+    }
+
     if (outRootCount) *outRootCount = rootCount;
     if (outIntermediateCount) *outIntermediateCount = intermediateCount;
     return TRUE;
 }
 
-BOOL cert_public_key_info_der(PCCERT_CONTEXT cert, BYTE** out, DWORD* outSize) {
-    if (!cert || !out || !outSize) return FALSE;
-    *out = NULL;
-    *outSize = 0;
-    if (!CryptEncodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        X509_PUBLIC_KEY_INFO,
-        &cert->pCertInfo->SubjectPublicKeyInfo,
-        CRYPT_ENCODE_ALLOC_FLAG,
-        NULL,
-        out,
-        outSize)) {
-        print_last_error("CryptEncodeObjectEx(X509_PUBLIC_KEY_INFO)");
-        return FALSE;
-    }
-    return TRUE;
-}
-
 BOOL export_cert_public_key_blob(PCCERT_CONTEXT cert, BYTE** outBlob, DWORD* outBlobSize) {
-    BCRYPT_KEY_HANDLE hKey = NULL;
-    DWORD cb = 0;
-    LPCWSTR blobType = NULL;
-    BYTE* blob = NULL;
-
-    if (!cert || !outBlob || !outBlobSize) return FALSE;
+    if (!outBlob || !outBlobSize) return FALSE;
     *outBlob = NULL;
     *outBlobSize = 0;
+
+    if (!cert || !cert->pCertInfo) return FALSE;
+    if (!cert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId) return FALSE;
+
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    DWORD cb = 0;
 
     if (!CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING,
         &cert->pCertInfo->SubjectPublicKeyInfo,
@@ -490,263 +474,135 @@ BOOL export_cert_public_key_blob(PCCERT_CONTEXT cert, BYTE** outBlob, DWORD* out
         return FALSE;
     }
 
-    if (cert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId &&
-        strcmp(cert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId, szOID_RSA_RSA) == 0) {
-        blobType = BCRYPT_RSAPUBLIC_BLOB;
-    }
-    else if (cert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId &&
-        strcmp(cert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId, szOID_ECC_PUBLIC_KEY) == 0) {
-        blobType = BCRYPT_ECCPUBLIC_BLOB;
-    }
-    else {
-        BCryptDestroyKey(hKey);
-        return FALSE;
-    }
+    LPCWSTR blobType = (strcmp(cert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId, szOID_RSA_RSA) == 0)
+        ? BCRYPT_RSAPUBLIC_BLOB
+        : BCRYPT_ECCPUBLIC_BLOB;
 
     if (BCryptExportKey(hKey, NULL, blobType, NULL, 0, &cb, 0) != STATUS_SUCCESS || cb == 0) {
         BCryptDestroyKey(hKey);
         return FALSE;
     }
 
-    blob = (BYTE*)malloc(cb);
-    if (!blob) {
+    *outBlob = (BYTE*)malloc(cb);
+    if (!*outBlob) {
         BCryptDestroyKey(hKey);
         return FALSE;
     }
 
-    if (BCryptExportKey(hKey, NULL, blobType, blob, cb, &cb, 0) != STATUS_SUCCESS) {
-        free(blob);
+    if (BCryptExportKey(hKey, NULL, blobType, *outBlob, cb, outBlobSize, 0) != STATUS_SUCCESS) {
+        free(*outBlob);
+        *outBlob = NULL;
+        *outBlobSize = 0;
         BCryptDestroyKey(hKey);
         return FALSE;
     }
 
     BCryptDestroyKey(hKey);
-    *outBlob = blob;
-    *outBlobSize = cb;
     return TRUE;
 }
 
-static BOOL compare_ecc_blobs(const BYTE* a, DWORD a_size, const BYTE* b, DWORD b_size) {
-    if (a_size != b_size || a_size < sizeof(BCRYPT_ECCKEY_BLOB)) return FALSE;
-
-    PBCRYPT_ECCKEY_BLOB hA = (PBCRYPT_ECCKEY_BLOB)a;
-    PBCRYPT_ECCKEY_BLOB hB = (PBCRYPT_ECCKEY_BLOB)b;
-
-    BOOL curve_match = FALSE;
-    if ((hA->dwMagic == BCRYPT_ECDH_PUBLIC_P256_MAGIC || hA->dwMagic == BCRYPT_ECDSA_PUBLIC_P256_MAGIC) &&
-        (hB->dwMagic == BCRYPT_ECDH_PUBLIC_P256_MAGIC || hB->dwMagic == BCRYPT_ECDSA_PUBLIC_P256_MAGIC)) {
-        curve_match = TRUE;
-    }
-    else if ((hA->dwMagic == BCRYPT_ECDH_PUBLIC_P384_MAGIC || hA->dwMagic == BCRYPT_ECDSA_PUBLIC_P384_MAGIC) &&
-        (hB->dwMagic == BCRYPT_ECDH_PUBLIC_P384_MAGIC || hB->dwMagic == BCRYPT_ECDSA_PUBLIC_P384_MAGIC)) {
-        curve_match = TRUE;
-    }
-
-    if (!curve_match || hA->cbKey != hB->cbKey) return FALSE;
-    return memcmp(a + sizeof(BCRYPT_ECCKEY_BLOB), b + sizeof(BCRYPT_ECCKEY_BLOB), a_size - sizeof(BCRYPT_ECCKEY_BLOB)) == 0;
-}
-
 BOOL ekpub_matches_cert(PCCERT_CONTEXT cert, const BYTE* ekPub, DWORD ekPubSize) {
+    if (!cert || !ekPub || ekPubSize == 0) return FALSE;
+
     BYTE* certBlob = NULL;
     DWORD certBlobSize = 0;
     BOOL ok = FALSE;
 
-    if (!cert || !ekPub || ekPubSize == 0) return FALSE;
-
     if (export_cert_public_key_blob(cert, &certBlob, &certBlobSize)) {
-        if (certBlobSize == ekPubSize) {
-            if (certBlobSize >= sizeof(BCRYPT_ECCKEY_BLOB) && (certBlob[0] == 'E' && certBlob[1] == 'C')) {
-                ok = compare_ecc_blobs(certBlob, certBlobSize, ekPub, ekPubSize);
-            }
-            else {
-                ok = (memcmp(certBlob, ekPub, ekPubSize) == 0);
-            }
+        if (certBlob && certBlobSize == ekPubSize) {
+            ok = (memcmp(certBlob, ekPub, ekPubSize) == 0);
         }
         free(certBlob);
     }
     return ok;
 }
 
-BOOL cert_signature_validates_against_issuer(PCCERT_CONTEXT subject, PCCERT_CONTEXT issuer) {
-    if (!subject || !issuer) return FALSE;
-    return CryptVerifyCertificateSignature(0,
-        X509_ASN_ENCODING,
-        subject->pbCertEncoded,
-        subject->cbCertEncoded,
-        &issuer->pCertInfo->SubjectPublicKeyInfo);
+BOOL calculate_sha256(const uint8_t* data, uint32_t size, uint8_t outDigest[32]) {
+    if (!outDigest || (!data && size != 0)) return FALSE;
+
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    DWORD cbObj = 0, cbData = sizeof(DWORD);
+    BOOL success = FALSE;
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != STATUS_SUCCESS) {
+        return FALSE;
+    }
+
+    if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbObj, cbData, &cbData, 0) == STATUS_SUCCESS && cbObj > 0) {
+        BYTE* hashObject = (BYTE*)malloc(cbObj);
+        if (hashObject) {
+            if (BCryptCreateHash(hAlg, &hHash, hashObject, cbObj, NULL, 0, 0) == STATUS_SUCCESS) {
+                NTSTATUS status = STATUS_SUCCESS;
+                if (data && size > 0) {
+                    status = BCryptHashData(hHash, (PUCHAR)data, size, 0);
+                }
+                if (status == STATUS_SUCCESS &&
+                    BCryptFinishHash(hHash, outDigest, 32, 0) == STATUS_SUCCESS) {
+                    success = TRUE;
+                }
+                BCryptDestroyHash(hHash);
+            }
+            free(hashObject);
+        }
+    }
+
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return success;
 }
 
 BOOL sha256_hex(const BYTE* data, DWORD size, char outHex[65]) {
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_HASH_HANDLE hHash = NULL;
+    if (!outHex) return FALSE;
     BYTE hash[32];
-    DWORD cbRes = 0, objLen = 0;
-    PUCHAR obj = NULL;
-    NTSTATUS st;
-
-    outHex[0] = '\0';
-    st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
-    if (st < 0) return FALSE;
-
-    st = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cbRes, 0);
-    if (st < 0 || objLen == 0) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (!calculate_sha256((const uint8_t*)data, (uint32_t)size, hash)) {
+        outHex[0] = '\0';
         return FALSE;
     }
-
-    obj = (PUCHAR)malloc(objLen);
-    if (!obj) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
-    }
-
-    st = BCryptCreateHash(hAlg, &hHash, obj, objLen, NULL, 0, 0);
-    if (st < 0) {
-        free(obj);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
-    }
-
-    st = BCryptHashData(hHash, (PUCHAR)data, size, 0);
-    if (st >= 0) st = BCryptFinishHash(hHash, hash, sizeof(hash), 0);
-
-    BCryptDestroyHash(hHash);
-    free(obj);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-
-    if (st < 0) return FALSE;
-
-    for (DWORD i = 0; i < sizeof(hash); ++i) {
-        StringCchPrintfA(outHex + (i * 2), 65 - ((size_t)(i) * 2), "%02x", hash[i]);
+    for (int i = 0; i < 32; ++i) {
+        StringCchPrintfA(outHex + (i * 2), 3, "%02x", hash[i]);
     }
     outHex[64] = '\0';
     return TRUE;
 }
 
-BOOL calculate_sha256(const uint8_t* data, uint32_t size, uint8_t outDigest[32]) {
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_HASH_HANDLE hHash = NULL;
-    DWORD cbHashObject = 0;
-    DWORD cbData = sizeof(DWORD);
-    NTSTATUS status;
-
-    status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
-    if (status != STATUS_SUCCESS) return FALSE;
-
-    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbHashObject, cbData, &cbData, 0);
-    if (status != STATUS_SUCCESS) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
-    }
-
-    BYTE* hashObject = (BYTE*)malloc(cbHashObject);
-    if (!hashObject) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
-    }
-
-    status = BCryptCreateHash(hAlg, &hHash, hashObject, cbHashObject, NULL, 0, 0);
-    if (status == STATUS_SUCCESS) {
-        status = BCryptHashData(hHash, (PUCHAR)data, size, 0);
-        if (status == STATUS_SUCCESS) {
-            status = BCryptFinishHash(hHash, outDigest, 32, 0);
-        }
-        BCryptDestroyHash(hHash);
-    }
-    free(hashObject);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return (status == STATUS_SUCCESS);
-}
-
 static const TRUSTED_URL kTrustedManufacturerUrls[] = {
-    { L"ekop.intel.com",               L"/ekcertservice",                    FALSE, TRUE  },
-    { L"ekcert.intel.com",             L"/ekcertservice",                    FALSE, TRUE  },
-    { L"ftpm.amd.com",                 L"/pki/aia",                          TRUE,  TRUE  },
-    { L"ekcert.spserv.microsoft.com",  L"/EKCertificate/GetEKCertificate/v1", FALSE, TRUE },
-    { L"pki.infineon.com",             L"/",                                 TRUE,  TRUE  },
-    { L"tpm.nuvoton.com",              L"/",                                 TRUE,  TRUE  }
+    { L"ekop.intel.com", L"/ekcertservice", FALSE, TRUE },
+    { L"ekcert.intel.com", L"/ekcertservice", FALSE, TRUE },
+    { L"ftpm.amd.com", L"/pki/aia", TRUE, TRUE },
+    { L"ekcert.spserv.microsoft.com", L"/EKCertificate/GetEKCertificate/v1", FALSE, TRUE },
+    { L"pki.infineon.com", L"/", TRUE, TRUE },
+    { L"tpm.nuvoton.com", L"/", TRUE, TRUE }
 };
 
-static BOOL host_equals_ci(const WCHAR* a, size_t a_len, const WCHAR* b) {
-    size_t b_len = wcslen(b);
-    if (a_len != b_len) return FALSE;
-    for (size_t i = 0; i < a_len; i++) {
-        if (towlower(a[i]) != towlower(b[i])) return FALSE;
-    }
-    return TRUE;
-}
-
-static BOOL path_starts_with_ci(const WCHAR* path, size_t path_len, const WCHAR* prefix) {
-    size_t prefix_len = wcslen(prefix);
-    if (path_len < prefix_len) return FALSE;
-    for (size_t i = 0; i < prefix_len; i++) {
-        if (towlower(path[i]) != towlower(prefix[i])) return FALSE;
-    }
-    return TRUE;
-}
-
-static BOOL extract_url_host_and_path(const WCHAR* url, const WCHAR** out_scheme,
-    const WCHAR** out_host, size_t* out_host_len, const WCHAR** out_path, size_t* out_path_len)
-{
-    const WCHAR* host_start;
-    const WCHAR* host_end;
-    const WCHAR* path_start;
-
-    if (!url || !out_scheme || !out_host || !out_host_len || !out_path || !out_path_len) return FALSE;
-
-    if (_wcsnicmp(url, L"https://", 8) == 0) {
-        *out_scheme = L"https";
-        host_start = url + 8;
-    }
-    else if (_wcsnicmp(url, L"http://", 7) == 0) {
-        *out_scheme = L"http";
-        host_start = url + 7;
-    }
-    else {
-        return FALSE;
-    }
-
-    if (*host_start == L'\0') return FALSE;
-
-    host_end = host_start;
-    while (*host_end && *host_end != L'/' && *host_end != L'?' && *host_end != L'#') host_end++;
-    if (host_end == host_start) return FALSE;
-
-    path_start = host_end;
-    if (*path_start == L'\0') path_start = L"/";
-
-    for (const WCHAR* p = host_start; p < host_end; p++) {
-        if (*p == L':') {
-            *out_host = host_start;
-            *out_host_len = (size_t)(p - host_start);
-            *out_path = path_start;
-            *out_path_len = wcslen(path_start);
-            return TRUE;
-        }
-    }
-
-    *out_host = host_start;
-    *out_host_len = (size_t)(host_end - host_start);
-    *out_path = path_start;
-    *out_path_len = wcslen(path_start);
-    return TRUE;
-}
-
 BOOL is_trusted_manufacturer_url(const WCHAR* url) {
-    const WCHAR* scheme;
-    const WCHAR* host, * path;
-    size_t host_len, path_len;
+    if (!url || !url_is_http(url)) return FALSE;
 
-    if (!extract_url_host_and_path(url, &scheme, &host, &host_len, &path, &path_len)) return FALSE;
+    const WCHAR* sep = wcsstr(url, L"://");
+    if (!sep) return FALSE;
+    const WCHAR* host = sep + 3;
+    const WCHAR* path = wcschr(host, L'/');
+    if (!path) return FALSE;
+
+    const WCHAR* host_end = host;
+    while (host_end < path && *host_end != L':') {
+        host_end++;
+    }
+    size_t host_len = (size_t)(host_end - host);
+    if (host_len == 0) return FALSE;
 
     for (size_t i = 0; i < sizeof(kTrustedManufacturerUrls) / sizeof(kTrustedManufacturerUrls[0]); i++) {
-        const TRUSTED_URL* t = &kTrustedManufacturerUrls[i];
-        if ((wcscmp(scheme, L"http") == 0 && !t->allow_http) ||
-            (wcscmp(scheme, L"https") == 0 && !t->allow_https)) {
-            continue;
-        }
-        if (host_equals_ci(host, host_len, t->host) && path_starts_with_ci(path, path_len, t->path_prefix)) {
-            return TRUE;
+        size_t trusted_host_len = wcslen(kTrustedManufacturerUrls[i].host);
+        if (host_len != trusted_host_len) continue;
+        if (_wcsnicmp(host, kTrustedManufacturerUrls[i].host, host_len) != 0) continue;
+
+        size_t prefix_len = wcslen(kTrustedManufacturerUrls[i].path_prefix);
+        if (_wcsnicmp(path, kTrustedManufacturerUrls[i].path_prefix, prefix_len) == 0) {
+            if (kTrustedManufacturerUrls[i].path_prefix[prefix_len - 1] == L'/' ||
+                path[prefix_len] == L'\0' ||
+                path[prefix_len] == L'/' ||
+                path[prefix_len] == L'?') {
+                return TRUE;
+            }
         }
     }
     return FALSE;
@@ -755,78 +611,37 @@ BOOL is_trusted_manufacturer_url(const WCHAR* url) {
 BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
     if (!cert || !cert->pCertInfo) return FALSE;
 
-    PCERT_EXTENSION pBasicConstraintsExt = CertFindExtension(
-        szOID_BASIC_CONSTRAINTS2,
+    PCERT_EXTENSION ext = CertFindExtension(szOID_BASIC_CONSTRAINTS2,
         cert->pCertInfo->cExtension,
-        cert->pCertInfo->rgExtension
-    );
+        cert->pCertInfo->rgExtension);
+    if (!ext || !ext->Value.pbData || ext->Value.cbData == 0) return FALSE;
 
-    if (pBasicConstraintsExt) {
-        CERT_BASIC_CONSTRAINTS2_INFO basicConstraints = { 0 };
-        DWORD cbBasicConstraints = sizeof(basicConstraints);
-        if (!CryptDecodeObjectEx(
-            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-            X509_BASIC_CONSTRAINTS2,
-            pBasicConstraintsExt->Value.pbData,
-            pBasicConstraintsExt->Value.cbData,
-            0,
-            NULL,
-            &basicConstraints,
-            &cbBasicConstraints)) {
+    CERT_BASIC_CONSTRAINTS2_INFO bc = { 0 };
+    DWORD cb = sizeof(bc);
+    if (!CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        X509_BASIC_CONSTRAINTS2,
+        ext->Value.pbData,
+        ext->Value.cbData,
+        0,
+        NULL,
+        &bc,
+        &cb)) {
+        return FALSE;
+    }
+    if (!bc.fCA) return FALSE;
+
+    BYTE keyUsage[2] = { 0 };
+    SetLastError(0);
+    if (CertGetIntendedKeyUsage(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        cert->pCertInfo,
+        keyUsage,
+        sizeof(keyUsage))) {
+        if ((keyUsage[0] & CERT_KEY_CERT_SIGN_KEY_USAGE) == 0) {
             return FALSE;
         }
-        if (!basicConstraints.fCA) return FALSE;
     }
     else {
-        pBasicConstraintsExt = CertFindExtension(
-            szOID_BASIC_CONSTRAINTS,
-            cert->pCertInfo->cExtension,
-            cert->pCertInfo->rgExtension
-        );
-        if (!pBasicConstraintsExt) return FALSE;
-
-        PCERT_BASIC_CONSTRAINTS_INFO pLegacyBC = NULL;
-        DWORD cbLegacyBC = 0;
-        if (CryptDecodeObjectEx(
-            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-            X509_BASIC_CONSTRAINTS,
-            pBasicConstraintsExt->Value.pbData,
-            pBasicConstraintsExt->Value.cbData,
-            CRYPT_DECODE_ALLOC_FLAG,
-            NULL,
-            &pLegacyBC,
-            &cbLegacyBC)) {
-            BOOL isCA = pLegacyBC->SubjectType.pbData && (pLegacyBC->SubjectType.pbData[0] & CERT_CA_SUBJECT_FLAG);
-            LocalFree(pLegacyBC);
-            if (!isCA) return FALSE;
-        }
-        else {
-            return FALSE;
-        }
-    }
-
-    PCERT_EXTENSION pKeyUsageExt = CertFindExtension(
-        szOID_KEY_USAGE,
-        cert->pCertInfo->cExtension,
-        cert->pCertInfo->rgExtension
-    );
-    if (pKeyUsageExt) {
-        PCRYPT_BIT_BLOB pKeyUsage = NULL;
-        DWORD cbKeyUsage = 0;
-        if (CryptDecodeObjectEx(
-            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-            X509_KEY_USAGE,
-            pKeyUsageExt->Value.pbData,
-            pKeyUsageExt->Value.cbData,
-            CRYPT_DECODE_ALLOC_FLAG,
-            NULL,
-            &pKeyUsage,
-            &cbKeyUsage)) {
-            BOOL isSignBitSet = (pKeyUsage->cbData > 0 && (pKeyUsage->pbData[0] & CERT_KEY_CERT_SIGN_KEY_USAGE));
-            LocalFree(pKeyUsage);
-            if (!isSignBitSet) return FALSE;
-        }
-        else {
+        if (GetLastError() != 0) {
             return FALSE;
         }
     }
@@ -836,22 +651,23 @@ BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
 
 BOOL check_cert_revocation(PCCERT_CONTEXT cert) {
     if (!cert) return FALSE;
-    PVOID rgpvContext[1] = { (PVOID)cert };
-    CERT_REVOCATION_STATUS revStatus = { 0 };
-    revStatus.cbSize = sizeof(revStatus);
 
-    BOOL res = CertVerifyRevocation(
-        X509_ASN_ENCODING,
+    CERT_REVOCATION_STATUS rev = { sizeof(rev) };
+    PVOID rgpvContext[1] = { (PVOID)cert };
+
+    if (CertVerifyRevocation(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
         CERT_CONTEXT_REVOCATION_TYPE,
         1,
         rgpvContext,
         0,
         NULL,
-        &revStatus
-    );
+        &rev)) {
+        return TRUE;
+    }
 
-    if (!res && revStatus.dwError == CRYPT_E_REVOKED) {
+    if (rev.dwError == CRYPT_E_REVOKED) {
         return FALSE;
     }
+
     return TRUE;
 }

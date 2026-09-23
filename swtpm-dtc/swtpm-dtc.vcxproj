@@ -141,10 +141,14 @@
       <StringPooling>true</StringPooling>
       <FloatingPointModel>Fast</FloatingPointModel>
       <IntelJCCErratum>true</IntelJCCErratum>
+      <EnableEnhancedInstructionSet>NotSet</EnableEnhancedInstructionSet>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+      <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
+      <CETCompat>true</CETCompat>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -159,8 +163,7 @@
     <ClCompile Include="passthrough.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="tpm_passthrough.h" />
-    <ClInclude Include="tpm_verify.h" />
+    <ClInclude Include="tpm.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

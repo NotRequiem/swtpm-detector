@@ -35,10 +35,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="tpm_verify.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="tpm_passthrough.h">
+    <ClInclude Include="tpm.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
