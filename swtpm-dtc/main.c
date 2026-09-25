@@ -361,7 +361,7 @@ cleanup:
     free_filelist(&g_extracted);
     if (cab) free(cab);
 
-    printf("Version: v4.1\n");
+    printf("Version: v5.0\n");
     system("pause");
     return ok ? 0 : 1;
 }
