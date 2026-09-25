@@ -126,38 +126,6 @@ static BOOL send_tpm_command(TBS_HCONTEXT h_tbs_context, const BYTE* cmd_buf, UI
     return (hr == TBS_SUCCESS);
 }
 
-BOOL tpm_pcr_extend(TBS_HCONTEXT hContext, UINT32 pcrIndex, const BYTE* digest32) {
-    if (!hContext || !digest32) return FALSE;
-    BYTE cmd[128];
-    buf_builder b;
-    init_builder(&b, cmd, sizeof(cmd));
-
-    write_16(&b, TPM_ST_SESSIONS);
-    write_32(&b, 0);
-    write_32(&b, TPM_CC_PCR_Extend);
-    write_32(&b, pcrIndex);
-
-    write_32(&b, 9);
-    write_32(&b, TPM_RS_PW);
-    write_16(&b, 0); write_8(&b, 0); write_16(&b, 0);
-
-    write_32(&b, 1);
-    write_16(&b, TPM_ALG_SHA256);
-    write_buf(&b, digest32, 32);
-
-    patch_32(cmd, 2, b.write_pos);
-
-    BYTE resp[256];
-    UINT32 respSize = sizeof(resp);
-    if (!send_tpm_command(hContext, cmd, b.write_pos, resp, &respSize)) return FALSE;
-    if (respSize < 10) return FALSE;
-
-    buf_parser p;
-    init_parser(&p, resp, respSize);
-    read_16(&p); read_32(&p);
-    return (read_32(&p) == 0);
-}
-
 static BOOL tpm_read_public(TBS_HCONTEXT h_tbs_context, UINT32 handle, BYTE* out_name, UINT16* out_name_size, BYTE* out_qn, UINT16* out_qn_size) {
     if (!h_tbs_context || handle == 0 || !out_name || !out_name_size) return FALSE;
     *out_name_size = 0;
@@ -771,95 +739,208 @@ static BOOL tpm_create_primary_ak(TBS_HCONTEXT h_tbs_context, UINT32* out_ak_han
     return (*out_ak_handle != 0);
 }
 
-static BOOL hmac_sha256(const BYTE* key, DWORD keyLen, const BYTE* data, DWORD dataLen, BYTE outMac[32]) {
-    if (!key || keyLen == 0 || !data || dataLen == 0 || !outMac) return FALSE;
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_HASH_HANDLE hHash = NULL;
-    DWORD cbObj = 0, cbData = sizeof(DWORD);
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (status != STATUS_SUCCESS) return FALSE;
-    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbObj, cbData, &cbData, 0);
-    if (status != STATUS_SUCCESS || cbObj == 0) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
+static BOOL tpm_create_primary_ek_attempt(TBS_HCONTEXT h_tbs_context, UINT16 unique_size, UINT32* out_ek_handle) {
+    if (!h_tbs_context || !out_ek_handle) return FALSE;
+    *out_ek_handle = 0;
+
+    const BYTE ek_policy[32] = {
+        0x83, 0x71, 0xAC, 0x02, 0xBB, 0x52, 0x4E, 0x3E,
+        0x8A, 0xAC, 0x14, 0x8E, 0xB3, 0xCD, 0x5F, 0x80,
+        0x0E, 0x6E, 0xEC, 0xE1, 0x89, 0x2F, 0x79, 0x66,
+        0x80, 0xC8, 0xDA, 0x42, 0xDA, 0xC1, 0xBE, 0x3D
+    };
+
+    BYTE in_public[512];
+    buf_builder pb;
+    init_builder(&pb, in_public, sizeof(in_public));
+    write_16(&pb, TPM_ALG_RSA);
+    write_16(&pb, TPM_ALG_SHA256);
+    write_32(&pb, 0x000300B2);
+    write_2b(&pb, ek_policy, sizeof(ek_policy));
+    write_16(&pb, 0x0006);
+    write_16(&pb, 128);
+    write_16(&pb, 0x0043);
+    write_16(&pb, TPM_ALG_NULL);
+    write_16(&pb, 2048);
+    write_32(&pb, 0);
+
+    if (unique_size > 0) {
+        BYTE zero_unique[256] = { 0 };
+        write_2b(&pb, zero_unique, unique_size);
     }
-    BYTE* obj = (BYTE*)malloc(cbObj);
-    if (!obj) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-        return FALSE;
+    else {
+        write_16(&pb, 0);
     }
-    status = BCryptCreateHash(hAlg, &hHash, obj, cbObj, (PUCHAR)key, keyLen, 0);
-    if (status == STATUS_SUCCESS) {
-        status = BCryptHashData(hHash, (PUCHAR)data, dataLen, 0);
-        if (status == STATUS_SUCCESS) {
-            status = BCryptFinishHash(hHash, outMac, 32, 0);
+    UINT16 in_public_size = (UINT16)pb.write_pos;
+
+    BYTE cmd[1024];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+    write_16(&b, TPM_ST_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_CreatePrimary);
+    write_32(&b, TPM_RH_ENDORSEMENT);
+
+    write_32(&b, 9);
+    write_32(&b, TPM_RS_PW);
+    write_16(&b, 0); write_8(&b, 0); write_16(&b, 0);
+
+    write_16(&b, 4); write_16(&b, 0); write_16(&b, 0);
+    write_16(&b, in_public_size);
+    write_buf(&b, in_public, in_public_size);
+    write_16(&b, 0); write_32(&b, 0);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 resp_size = sizeof(resp);
+    if (send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) {
+        if (resp_size >= 14) {
+            buf_parser p;
+            init_parser(&p, resp, resp_size);
+            read_16(&p); read_32(&p);
+            if (read_32(&p) == 0) {
+                *out_ek_handle = read_32(&p);
+                if (*out_ek_handle != 0) return TRUE;
+            }
         }
-        BCryptDestroyHash(hHash);
+    }
+
+    UINT32 policy_session = 0;
+    if (!tpm_start_auth_session(h_tbs_context, &policy_session)) return FALSE;
+    if (!tpm_policy_secret(h_tbs_context, policy_session)) {
+        tpm_flush_context(h_tbs_context, policy_session);
+        return FALSE;
+    }
+
+    init_builder(&b, cmd, sizeof(cmd));
+    write_16(&b, TPM_ST_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_CreatePrimary);
+    write_32(&b, TPM_RH_ENDORSEMENT);
+
+    write_32(&b, 9);
+    write_32(&b, policy_session);
+    write_16(&b, 0); write_8(&b, 0); write_16(&b, 0);
+
+    write_16(&b, 4); write_16(&b, 0); write_16(&b, 0);
+    write_16(&b, in_public_size);
+    write_buf(&b, in_public, in_public_size);
+    write_16(&b, 0); write_32(&b, 0);
+
+    patch_32(cmd, 2, b.write_pos);
+
+    resp_size = sizeof(resp);
+    BOOL ok = send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size);
+    tpm_flush_context(h_tbs_context, policy_session);
+    if (!ok || resp_size < 14) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p); read_32(&p);
+    if (read_32(&p) != 0) return FALSE;
+
+    *out_ek_handle = read_32(&p);
+    return (*out_ek_handle != 0);
+}
+
+static BOOL tpm_create_primary_ek(TBS_HCONTEXT h_tbs_context, UINT32* out_ek_handle) {
+    if (tpm_create_primary_ek_attempt(h_tbs_context, 256, out_ek_handle)) {
+        return TRUE;
+    }
+    return tpm_create_primary_ek_attempt(h_tbs_context, 0, out_ek_handle);
+}
+
+static BOOL hmac_sha256(const BYTE* key, DWORD key_len, const BYTE* data, DWORD data_len, BYTE out_mac[32]) {
+    if (!key || key_len == 0 || !data || data_len == 0 || !out_mac) return FALSE;
+    BCRYPT_ALG_HANDLE h_alg = NULL;
+    BCRYPT_HASH_HANDLE h_hash = NULL;
+    DWORD cb_obj = 0, cb_data = sizeof(DWORD);
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&h_alg, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (status != STATUS_SUCCESS) return FALSE;
+    status = BCryptGetProperty(h_alg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cb_obj, cb_data, &cb_data, 0);
+    if (status != STATUS_SUCCESS || cb_obj == 0) {
+        BCryptCloseAlgorithmProvider(h_alg, 0);
+        return FALSE;
+    }
+    BYTE* obj = (BYTE*)malloc(cb_obj);
+    if (!obj) {
+        BCryptCloseAlgorithmProvider(h_alg, 0);
+        return FALSE;
+    }
+    status = BCryptCreateHash(h_alg, &h_hash, obj, cb_obj, (PUCHAR)key, key_len, 0);
+    if (status == STATUS_SUCCESS) {
+        status = BCryptHashData(h_hash, (PUCHAR)data, data_len, 0);
+        if (status == STATUS_SUCCESS) {
+            status = BCryptFinishHash(h_hash, out_mac, 32, 0);
+        }
+        BCryptDestroyHash(h_hash);
     }
     free(obj);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
+    BCryptCloseAlgorithmProvider(h_alg, 0);
     return (status == STATUS_SUCCESS);
 }
 
 static BOOL aes_128_ecb_encrypt_block(const BYTE key[16], const BYTE in[16], BYTE out[16]) {
     if (!key || !in || !out) return FALSE;
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    BCRYPT_KEY_HANDLE hKey = NULL;
-    DWORD cbObj = 0, cbData = sizeof(DWORD);
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
+    BCRYPT_ALG_HANDLE h_alg = NULL;
+    BCRYPT_KEY_HANDLE h_key = NULL;
+    DWORD cb_obj = 0, cb_data = sizeof(DWORD);
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&h_alg, BCRYPT_AES_ALGORITHM, NULL, 0);
     if (status != STATUS_SUCCESS) return FALSE;
-    status = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (PBYTE)BCRYPT_CHAIN_MODE_ECB, sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
+    status = BCryptSetProperty(h_alg, BCRYPT_CHAINING_MODE, (PBYTE)BCRYPT_CHAIN_MODE_ECB, sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
     if (status != STATUS_SUCCESS) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+        BCryptCloseAlgorithmProvider(h_alg, 0);
         return FALSE;
     }
-    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cbObj, cbData, &cbData, 0);
-    if (status != STATUS_SUCCESS || cbObj == 0) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+    status = BCryptGetProperty(h_alg, BCRYPT_OBJECT_LENGTH, (PBYTE)&cb_obj, cb_data, &cb_data, 0);
+    if (status != STATUS_SUCCESS || cb_obj == 0) {
+        BCryptCloseAlgorithmProvider(h_alg, 0);
         return FALSE;
     }
-    BYTE* obj = (BYTE*)malloc(cbObj);
+    BYTE* obj = (BYTE*)malloc(cb_obj);
     if (!obj) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+        BCryptCloseAlgorithmProvider(h_alg, 0);
         return FALSE;
     }
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, obj, cbObj, (PUCHAR)key, 16, 0);
+    status = BCryptGenerateSymmetricKey(h_alg, &h_key, obj, cb_obj, (PUCHAR)key, 16, 0);
     if (status == STATUS_SUCCESS) {
         DWORD res = 0;
-        status = BCryptEncrypt(hKey, (PUCHAR)in, 16, NULL, NULL, 0, out, 16, &res, 0);
-        BCryptDestroyKey(hKey);
+        status = BCryptEncrypt(h_key, (PUCHAR)in, 16, NULL, NULL, 0, out, 16, &res, 0);
+        BCryptDestroyKey(h_key);
     }
     free(obj);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
+    BCryptCloseAlgorithmProvider(h_alg, 0);
     return (status == STATUS_SUCCESS);
 }
 
 static BOOL local_software_make_credential(
-    PCCERT_CONTEXT ekCert,
+    PCCERT_CONTEXT ek_cert,
     const BYTE* challenge,
-    UINT16 challengeSize,
-    const BYTE* akName,
-    UINT16 akNameSize,
-    BYTE* outBlob,
-    UINT16* outBlobSize,
-    BYTE* outSecret,
-    UINT16* outSecretSize)
+    UINT16 challenge_size,
+    const BYTE* ak_name,
+    UINT16 ak_name_size,
+    BYTE* out_blob,
+    UINT16* out_blob_size,
+    BYTE* out_secret,
+    UINT16* out_secret_size)
 {
-    if (!ekCert || !ekCert->pCertInfo || !challenge || challengeSize == 0 || challengeSize > 32 ||
-        !akName || akNameSize == 0 || akNameSize > 64 ||
-        !outBlob || !outBlobSize || !outSecret || !outSecretSize) {
+    if (!ek_cert || !ek_cert->pCertInfo || !challenge || challenge_size == 0 || challenge_size > 32 ||
+        !ak_name || ak_name_size == 0 || ak_name_size > 64 ||
+        !out_blob || !out_blob_size || !out_secret || !out_secret_size) {
         return FALSE;
     }
-    *outBlobSize = 0;
-    *outSecretSize = 0;
+    *out_blob_size = 0;
+    *out_secret_size = 0;
 
-    BCRYPT_KEY_HANDLE hEkKey = NULL;
-    if (!CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, &ekCert->pCertInfo->SubjectPublicKeyInfo, 0, NULL, &hEkKey)) {
+    BCRYPT_KEY_HANDLE h_ek_key = NULL;
+    if (!CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, &ek_cert->pCertInfo->SubjectPublicKeyInfo, 0, NULL, &h_ek_key)) {
         return FALSE;
     }
 
     BYTE seed[32];
     if (BCryptGenRandom(NULL, seed, sizeof(seed), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != STATUS_SUCCESS) {
+        BCryptDestroyKey(h_ek_key);
         return FALSE;
     }
 
@@ -868,59 +949,59 @@ static BOOL local_software_make_credential(
     oaep.pbLabel = (PUCHAR)"IDENTITY";
     oaep.cbLabel = 9;
 
-    DWORD encSecretLen = 0;
-    NTSTATUS status = BCryptEncrypt(hEkKey, seed, sizeof(seed), &oaep, NULL, 0, outSecret, 1024, &encSecretLen, BCRYPT_PAD_OAEP);
-    BCryptDestroyKey(hEkKey);
-    if (status != STATUS_SUCCESS || encSecretLen == 0 || encSecretLen > 1024) {
+    DWORD enc_secret_len = 0;
+    NTSTATUS status = BCryptEncrypt(h_ek_key, seed, sizeof(seed), &oaep, NULL, 0, out_secret, 1024, &enc_secret_len, BCRYPT_PAD_OAEP);
+    BCryptDestroyKey(h_ek_key);
+    if (status != STATUS_SUCCESS || enc_secret_len == 0 || enc_secret_len > 1024) {
         SecureZeroMemory(seed, sizeof(seed));
         return FALSE;
     }
-    *outSecretSize = (UINT16)encSecretLen;
+    *out_secret_size = (UINT16)enc_secret_len;
 
-    BYTE hmacInput[18];
-    patch_32(hmacInput, 0, 1);
-    memcpy(hmacInput + 4, "INTEGRITY", 10);
-    patch_32(hmacInput, 14, 256);
-    BYTE hmacKey[32];
-    if (!hmac_sha256(seed, sizeof(seed), hmacInput, sizeof(hmacInput), hmacKey)) {
+    BYTE hmac_input[18];
+    patch_32(hmac_input, 0, 1);
+    memcpy(hmac_input + 4, "INTEGRITY", 10);
+    patch_32(hmac_input, 14, 256);
+    BYTE hmac_key[32];
+    if (!hmac_sha256(seed, sizeof(seed), hmac_input, sizeof(hmac_input), hmac_key)) {
         SecureZeroMemory(seed, sizeof(seed));
         return FALSE;
     }
 
-    BYTE storageInput[128];
-    patch_32(storageInput, 0, 1);
-    memcpy(storageInput + 4, "STORAGE", 8);
-    memcpy(storageInput + 12, akName, akNameSize);
-    patch_32(storageInput, 12 + akNameSize, 128);
-    BYTE symKeyFull[32];
-    if (!hmac_sha256(seed, sizeof(seed), storageInput, 16 + akNameSize, symKeyFull)) {
+    BYTE storage_input[128];
+    patch_32(storage_input, 0, 1);
+    memcpy(storage_input + 4, "STORAGE", 8);
+    memcpy(storage_input + 12, ak_name, ak_name_size);
+    patch_32(storage_input, 12 + ak_name_size, 128);
+    BYTE sym_key_full[32];
+    if (!hmac_sha256(seed, sizeof(seed), storage_input, 16 + ak_name_size, sym_key_full)) {
         SecureZeroMemory(seed, sizeof(seed));
-        SecureZeroMemory(hmacKey, sizeof(hmacKey));
+        SecureZeroMemory(hmac_key, sizeof(hmac_key));
         return FALSE;
     }
 
-    BYTE symKey[16];
-    memcpy(symKey, symKeyFull, 16);
+    BYTE sym_key[16];
+    memcpy(sym_key, sym_key_full, 16);
     SecureZeroMemory(seed, sizeof(seed));
-    SecureZeroMemory(symKeyFull, sizeof(symKeyFull));
+    SecureZeroMemory(sym_key_full, sizeof(sym_key_full));
 
     BYTE pt[64] = { 0 };
-    pt[0] = (challengeSize >> 8) & 0xFF;
-    pt[1] = challengeSize & 0xFF;
-    memcpy(pt + 2, challenge, challengeSize);
-    UINT32 ptLen = 2 + challengeSize;
+    pt[0] = (challenge_size >> 8) & 0xFF;
+    pt[1] = challenge_size & 0xFF;
+    memcpy(pt + 2, challenge, challenge_size);
+    UINT32 pt_len = 2 + challenge_size;
 
     BYTE ct[64] = { 0 };
     BYTE iv[16] = { 0 };
     BYTE pad[16] = { 0 };
     UINT32 pos = 0;
-    while (pos < ptLen) {
-        if (!aes_128_ecb_encrypt_block(symKey, iv, pad)) {
-            SecureZeroMemory(symKey, sizeof(symKey));
-            SecureZeroMemory(hmacKey, sizeof(hmacKey));
+    while (pos < pt_len) {
+        if (!aes_128_ecb_encrypt_block(sym_key, iv, pad)) {
+            SecureZeroMemory(sym_key, sizeof(sym_key));
+            SecureZeroMemory(hmac_key, sizeof(hmac_key));
             return FALSE;
         }
-        UINT32 chunk = ptLen - pos;
+        UINT32 chunk = pt_len - pos;
         if (chunk > 16) chunk = 16;
         for (UINT32 k = 0; k < chunk; k++) {
             ct[pos + k] = pt[pos + k] ^ pad[k];
@@ -928,61 +1009,58 @@ static BOOL local_software_make_credential(
         }
         pos += chunk;
     }
-    SecureZeroMemory(symKey, sizeof(symKey));
+    SecureZeroMemory(sym_key, sizeof(sym_key));
 
-    BYTE hmacTarget[128];
-    memcpy(hmacTarget, ct, ptLen);
-    memcpy(hmacTarget + ptLen, akName, akNameSize);
-    BYTE outerHmac[32];
-    if (!hmac_sha256(hmacKey, sizeof(hmacKey), hmacTarget, ptLen + akNameSize, outerHmac)) {
-        SecureZeroMemory(hmacKey, sizeof(hmacKey));
+    BYTE hmac_target[128];
+    memcpy(hmac_target, ct, pt_len);
+    memcpy(hmac_target + pt_len, ak_name, ak_name_size);
+    BYTE outer_hmac[32];
+    if (!hmac_sha256(hmac_key, sizeof(hmac_key), hmac_target, pt_len + ak_name_size, outer_hmac)) {
+        SecureZeroMemory(hmac_key, sizeof(hmac_key));
         return FALSE;
     }
-    SecureZeroMemory(hmacKey, sizeof(hmacKey));
+    SecureZeroMemory(hmac_key, sizeof(hmac_key));
 
-    outBlob[0] = 0x00;
-    outBlob[1] = 0x20;
-    memcpy(outBlob + 2, outerHmac, 32);
-    memcpy(outBlob + 34, ct, ptLen);
-    *outBlobSize = (UINT16)(34 + ptLen);
+    out_blob[0] = 0x00;
+    out_blob[1] = 0x20;
+    memcpy(out_blob + 2, outer_hmac, 32);
+    memcpy(out_blob + 34, ct, pt_len);
+    *out_blob_size = (UINT16)(34 + pt_len);
     return TRUE;
 }
 
 static BOOL validate_and_compute_ak_names(
-    const BYTE* akPubTpm2b,
-    DWORD akPubTpm2bSize,
-    const BYTE* reportedAkName,
-    UINT16 reportedAkNameSize,
-    BYTE outAkName[34],
-    BYTE outExpectedQn[34])
+    const BYTE* ak_pub_tpm2b,
+    DWORD ak_pub_tpm2b_size,
+    const BYTE* reported_ak_name,
+    UINT16 reported_ak_name_size,
+    const BYTE* reported_ak_qn,
+    UINT16 reported_ak_qn_size,
+    BYTE out_ak_name[34],
+    BYTE out_expected_qn[34])
 {
-    if (!akPubTpm2b || akPubTpm2bSize < 14 || !reportedAkName || !outAkName || !outExpectedQn) return FALSE;
+    if (!ak_pub_tpm2b || ak_pub_tpm2b_size < 14 || !reported_ak_name || !out_ak_name || !out_expected_qn) return FALSE;
 
     buf_parser p;
-    init_parser(&p, akPubTpm2b, akPubTpm2bSize);
-    UINT16 pubSize = read_16(&p);
-    if (pubSize == 0 || p.size - p.read_pos < pubSize) return FALSE;
-    UINT32 maxEnd = p.read_pos + pubSize;
+    init_parser(&p, ak_pub_tpm2b, ak_pub_tpm2b_size);
+    UINT16 pub_size = read_16(&p);
+    if (pub_size == 0 || p.size - p.read_pos < pub_size) return FALSE;
+    UINT32 max_end = p.read_pos + pub_size;
 
     UINT16 type = read_16(&p);
-    UINT16 nameAlg = read_16(&p);
-    if (type != TPM_ALG_RSA || nameAlg != TPM_ALG_SHA256) return FALSE;
+    UINT16 name_alg = read_16(&p);
+    if (type != TPM_ALG_RSA || name_alg != TPM_ALG_SHA256) return FALSE;
 
     UINT32 attrs = read_32(&p);
-    if ((attrs & 0x00000002) == 0) return FALSE;
-    if ((attrs & 0x00000010) == 0) return FALSE;
-    if ((attrs & 0x00000020) == 0) return FALSE;
-    if ((attrs & 0x00000040) == 0) return FALSE;
-    if ((attrs & 0x00000080) != 0) return FALSE;
-    if ((attrs & 0x00010000) == 0) return FALSE;
-    if ((attrs & 0x00020000) != 0) return FALSE;
-    if ((attrs & 0x00040000) == 0) return FALSE;
+    if (attrs != 0x00050072) {
+        return FALSE;
+    }
 
-    UINT16 authPolicySize = read_16(&p);
-    if (p.size - p.read_pos < authPolicySize || p.read_pos + authPolicySize > maxEnd) return FALSE;
-    p.read_pos += authPolicySize;
+    UINT16 auth_policy_size = read_16(&p);
+    if (auth_policy_size != 0 || p.size - p.read_pos < auth_policy_size || p.read_pos + auth_policy_size > max_end) return FALSE;
+    p.read_pos += auth_policy_size;
 
-    if (p.read_pos + 12 > maxEnd) return FALSE;
+    if (p.read_pos + 12 > max_end) return FALSE;
     if (read_16(&p) != TPM_ALG_NULL) return FALSE;
     if (read_16(&p) != TPM_ALG_RSASSA) return FALSE;
     if (read_16(&p) != TPM_ALG_SHA256) return FALSE;
@@ -990,28 +1068,35 @@ static BOOL validate_and_compute_ak_names(
     UINT32 exp = read_32(&p);
     if (exp != 0 && exp != 65537) return FALSE;
 
-    if (p.read_pos + 2 > maxEnd) return FALSE;
-    UINT16 modSize = read_16(&p);
-    if (modSize != 256 || p.read_pos + modSize > maxEnd) return FALSE;
+    if (p.read_pos + 2 > max_end) return FALSE;
+    UINT16 mod_size = read_16(&p);
+    if (mod_size != 256 || p.read_pos + mod_size > max_end) return FALSE;
 
-    outAkName[0] = 0x00;
-    outAkName[1] = 0x0B;
-    calculate_sha256(akPubTpm2b + 2, pubSize, outAkName + 2);
+    out_ak_name[0] = 0x00;
+    out_ak_name[1] = 0x0B;
+    calculate_sha256(ak_pub_tpm2b + 2, pub_size, out_ak_name + 2);
 
-    if (reportedAkNameSize != 34 || memcmp(reportedAkName, outAkName, 34) != 0) {
+    if (reported_ak_name_size != 34 || memcmp(reported_ak_name, out_ak_name, 34) != 0) {
         return FALSE;
     }
 
-    BYTE qnSeedConcat[38] = { 0 };
-    qnSeedConcat[0] = 0x40;
-    qnSeedConcat[1] = 0x00;
-    qnSeedConcat[2] = 0x00;
-    qnSeedConcat[3] = 0x0B;
-    memcpy(qnSeedConcat + 4, outAkName, 34);
+    BYTE qn_seed_concat[38] = { 0 };
+    qn_seed_concat[0] = 0x40;
+    qn_seed_concat[1] = 0x00;
+    qn_seed_concat[2] = 0x00;
+    qn_seed_concat[3] = 0x0B;
+    memcpy(qn_seed_concat + 4, out_ak_name, 34);
 
-    outExpectedQn[0] = 0x00;
-    outExpectedQn[1] = 0x0B;
-    calculate_sha256(qnSeedConcat, sizeof(qnSeedConcat), outExpectedQn + 2);
+    out_expected_qn[0] = 0x00;
+    out_expected_qn[1] = 0x0B;
+    calculate_sha256(qn_seed_concat, sizeof(qn_seed_concat), out_expected_qn + 2);
+
+    if (reported_ak_qn && reported_ak_qn_size > 0) {
+        if (reported_ak_qn_size != 34 || memcmp(reported_ak_qn, out_expected_qn, 34) != 0) {
+            return FALSE;
+        }
+    }
+
     return TRUE;
 }
 
@@ -1119,7 +1204,8 @@ static BOOL execute_possession_challenge(
 
     BYTE challenge[32];
     if (BCryptGenRandom(NULL, challenge, sizeof(challenge), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != STATUS_SUCCESS) {
-       return FALSE;
+        tpm_flush_context(h_tbs_context, policy_session);
+        return FALSE;
     }
 
     BYTE blob[1024];
@@ -1330,25 +1416,44 @@ BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
         if (tpm_enumerate_persistent_handles(h_tbs_context, handles, &handle_count)) {
             for (UINT32 i = 0; i < handle_count; i++) {
                 if (handles[i] >= 0x81010000 && handles[i] <= 0x810100FF) {
-                    ek_handle = handles[i];
-                    break;
+                    BYTE* ek_pub_tpm2b = NULL;
+                    DWORD ek_pub_tpm2b_size = 0;
+                    if (tpm_read_public_area(h_tbs_context, handles[i], &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
+                        if (ek_pub_tpm2b_size >= 4 && ((ek_pub_tpm2b[2] << 8) | ek_pub_tpm2b[3]) == TPM_ALG_RSA) {
+                            ek_handle = handles[i];
+                            DWORD bcrypt_blob_size = 0;
+                            BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
+                            if (bcrypt_blob) {
+                                info->ekPub = bcrypt_blob;
+                                info->ekPubSize = bcrypt_blob_size;
+                                sha256_hex(info->ekPub, info->ekPubSize, info->ekPubSha256);
+                                nvram_success = TRUE;
+                            }
+                            free(ek_pub_tpm2b);
+                            break;
+                        }
+                        free(ek_pub_tpm2b);
+                    }
                 }
             }
         }
-        if (ek_handle != 0) {
-            BYTE* ek_pub_tpm2b = NULL;
-            DWORD ek_pub_tpm2b_size = 0;
-
-            if (tpm_read_public_area(h_tbs_context, ek_handle, &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
-                DWORD bcrypt_blob_size = 0;
-                BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
-                if (bcrypt_blob) {
-                    info->ekPub = bcrypt_blob;
-                    info->ekPubSize = bcrypt_blob_size;
-                    sha256_hex(info->ekPub, info->ekPubSize, info->ekPubSha256);
-                    nvram_success = TRUE;
+        if (!nvram_success) {
+            UINT32 dynamic_ek_handle = 0;
+            if (tpm_create_primary_ek(h_tbs_context, &dynamic_ek_handle)) {
+                BYTE* ek_pub_tpm2b = NULL;
+                DWORD ek_pub_tpm2b_size = 0;
+                if (tpm_read_public_area(h_tbs_context, dynamic_ek_handle, &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
+                    DWORD bcrypt_blob_size = 0;
+                    BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
+                    if (bcrypt_blob) {
+                        info->ekPub = bcrypt_blob;
+                        info->ekPubSize = bcrypt_blob_size;
+                        sha256_hex(info->ekPub, info->ekPubSize, info->ekPubSha256);
+                        nvram_success = TRUE;
+                    }
+                    free(ek_pub_tpm2b);
                 }
-                free(ek_pub_tpm2b);
+                tpm_flush_context(h_tbs_context, dynamic_ek_handle);
             }
         }
         Tbsip_Context_Close(h_tbs_context);
@@ -1492,10 +1597,10 @@ BOOL build_candidate_issuer_store(HCERTSTORE h_cab_store, HCERTSTORE* out_store)
     return TRUE;
 }
 
-static BOOL tpm_quote(TBS_HCONTEXT hContext, UINT32 akHandle, const BYTE* nonce, UINT16 nonceSize, BYTE* outAttest, UINT16* outAttestSize, BYTE* outSig, UINT16* outSigSize) {
-    if (!hContext || akHandle == 0 || !nonce || nonceSize == 0) return FALSE;
-    if (outAttestSize) *outAttestSize = 0;
-    if (outSigSize) *outSigSize = 0;
+static BOOL tpm_quote(TBS_HCONTEXT h_tbs_context, UINT32 ak_handle, const BYTE* nonce, UINT16 nonce_size, BYTE* out_attest, UINT16* out_attest_size, BYTE* out_sig, UINT16* out_sig_size) {
+    if (!h_tbs_context || ak_handle == 0 || !nonce || nonce_size == 0) return FALSE;
+    if (out_attest_size) *out_attest_size = 0;
+    if (out_sig_size) *out_sig_size = 0;
 
     BYTE cmd[1024];
     buf_builder b;
@@ -1504,189 +1609,186 @@ static BOOL tpm_quote(TBS_HCONTEXT hContext, UINT32 akHandle, const BYTE* nonce,
     write_16(&b, TPM_ST_SESSIONS);
     write_32(&b, 0);
     write_32(&b, TPM_CC_Quote);
-    write_32(&b, akHandle);
+    write_32(&b, ak_handle);
 
     write_32(&b, 9);
     write_32(&b, TPM_RS_PW);
     write_16(&b, 0); write_8(&b, 0); write_16(&b, 0);
 
-    write_2b(&b, nonce, nonceSize);
+    write_2b(&b, nonce, nonce_size);
     write_16(&b, TPM_ALG_NULL);
 
-    // TPML_PCR_SELECTION
-    // count = 1 selection
-    // alg = TPM_ALG_SHA256
-    // sizeofSelect = 3 bytes
-    // byte 0: 0xFE (PCRs 1, 2, 3, 4, 5, 6, 7 - PCR 0 strictly excluded)
-    // byte 1: 0x78 (PCRs 11, 12, 13, 14: bit 3=11, bit 4=12, bit 5=13, bit 6=14)
-    // byte 2: 0x01 (PCR 16: bit 0=16)
     write_32(&b, 1);
     write_16(&b, TPM_ALG_SHA256);
     write_8(&b, 3);
     write_8(&b, 0xFE);
     write_8(&b, 0x78);
-    write_8(&b, 0x01);
+    write_8(&b, 0x00);
 
     patch_32(cmd, 2, b.write_pos);
 
     BYTE resp[4096];
-    UINT32 respSize = sizeof(resp);
-    if (!send_tpm_command(hContext, cmd, b.write_pos, resp, &respSize)) return FALSE;
-    if (respSize < 10) return FALSE;
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+    if (resp_size < 10) return FALSE;
 
     buf_parser p;
-    init_parser(&p, resp, respSize);
+    init_parser(&p, resp, resp_size);
     UINT16 tag = read_16(&p);
     read_32(&p);
     if (read_32(&p) != 0) return FALSE;
     if (tag == TPM_ST_SESSIONS) read_32(&p);
 
-    UINT16 attestSize = read_16(&p);
-    if (attestSize == 0 || attestSize > 1024 || p.size - p.read_pos < attestSize) return FALSE;
-    if (outAttest && outAttestSize) {
-        memcpy(outAttest, p.buf + p.read_pos, attestSize);
-        *outAttestSize = attestSize;
+    UINT16 attest_size = read_16(&p);
+    if (attest_size == 0 || attest_size > 1024 || p.size - p.read_pos < attest_size) return FALSE;
+    if (out_attest && out_attest_size) {
+        memcpy(out_attest, p.buf + p.read_pos, attest_size);
+        *out_attest_size = attest_size;
     }
-    p.read_pos += attestSize;
+    p.read_pos += attest_size;
 
     if (p.size - p.read_pos < 6) return FALSE;
     if (read_16(&p) != TPM_ALG_RSASSA || read_16(&p) != TPM_ALG_SHA256) return FALSE;
 
-    UINT16 sigSize = read_16(&p);
-    if (sigSize == 0 || sigSize > 512 || p.size - p.read_pos < sigSize) return FALSE;
-    if (outSig && outSigSize) {
-        memcpy(outSig, p.buf + p.read_pos, sigSize);
-        *outSigSize = sigSize;
+    UINT16 sig_size = read_16(&p);
+    if (sig_size == 0 || sig_size > 512 || p.size - p.read_pos < sig_size) return FALSE;
+    if (out_sig && out_sig_size) {
+        memcpy(out_sig, p.buf + p.read_pos, sig_size);
+        *out_sig_size = sig_size;
     }
     return TRUE;
 }
 
-static BOOL verify_quote_signature(const BYTE* attestBytes, UINT16 attestSize, const BYTE* sigBytes, UINT16 sigSize, const BYTE* akPubTpm2b, DWORD akPubTpm2bSize) {
-    if (!attestBytes || attestSize == 0 || !sigBytes || sigSize == 0 || !akPubTpm2b || akPubTpm2bSize == 0) return FALSE;
+static BOOL verify_quote_signature(const BYTE* attest_bytes, UINT16 attest_size, const BYTE* sig_bytes, UINT16 sig_size, const BYTE* ak_pub_tpm2b, DWORD ak_pub_tpm2b_size) {
+    if (!attest_bytes || attest_size == 0 || !sig_bytes || sig_size == 0 || !ak_pub_tpm2b || ak_pub_tpm2b_size == 0) return FALSE;
 
-    DWORD bcryptBlobSize = 0;
-    BYTE* bcryptBlob = tpm_public_to_bcrypt_blob(akPubTpm2b, akPubTpm2bSize, &bcryptBlobSize);
-    if (!bcryptBlob) return FALSE;
+    DWORD bcrypt_blob_size = 0;
+    BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ak_pub_tpm2b, ak_pub_tpm2b_size, &bcrypt_blob_size);
+    if (!bcrypt_blob) return FALSE;
 
-    BCRYPT_ALG_HANDLE hRsaAlg = NULL;
-    BCRYPT_KEY_HANDLE hKey = NULL;
-    BYTE attestHash[32];
+    BCRYPT_ALG_HANDLE h_rsa_alg = NULL;
+    BCRYPT_KEY_HANDLE h_key = NULL;
+    BYTE attest_hash[32];
 
-    if (!calculate_sha256(attestBytes, attestSize, attestHash)) {
-        free(bcryptBlob);
+    if (!calculate_sha256(attest_bytes, attest_size, attest_hash)) {
+        free(bcrypt_blob);
         return FALSE;
     }
 
-    if (BCryptOpenAlgorithmProvider(&hRsaAlg, BCRYPT_RSA_ALGORITHM, NULL, 0) != STATUS_SUCCESS) {
-        free(bcryptBlob);
+    if (BCryptOpenAlgorithmProvider(&h_rsa_alg, BCRYPT_RSA_ALGORITHM, NULL, 0) != STATUS_SUCCESS) {
+        free(bcrypt_blob);
         return FALSE;
     }
 
-    if (BCryptImportKeyPair(hRsaAlg, NULL, BCRYPT_RSAPUBLIC_BLOB, &hKey, bcryptBlob, bcryptBlobSize, 0) != STATUS_SUCCESS) {
-        BCryptCloseAlgorithmProvider(hRsaAlg, 0);
-        free(bcryptBlob);
+    if (BCryptImportKeyPair(h_rsa_alg, NULL, BCRYPT_RSAPUBLIC_BLOB, &h_key, bcrypt_blob, bcrypt_blob_size, 0) != STATUS_SUCCESS) {
+        BCryptCloseAlgorithmProvider(h_rsa_alg, 0);
+        free(bcrypt_blob);
         return FALSE;
     }
 
-    BCRYPT_PKCS1_PADDING_INFO padInfo = { 0 };
-    padInfo.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+    BCRYPT_PKCS1_PADDING_INFO pad_info = { 0 };
+    pad_info.pszAlgId = BCRYPT_SHA256_ALGORITHM;
 
-    NTSTATUS status = BCryptVerifySignature(hKey, &padInfo, attestHash, sizeof(attestHash), (PUCHAR)sigBytes, sigSize, BCRYPT_PAD_PKCS1);
+    NTSTATUS status = BCryptVerifySignature(h_key, &pad_info, attest_hash, sizeof(attest_hash), (PUCHAR)sig_bytes, sig_size, BCRYPT_PAD_PKCS1);
 
-    BCryptDestroyKey(hKey);
-    BCryptCloseAlgorithmProvider(hRsaAlg, 0);
-    free(bcryptBlob);
+    BCryptDestroyKey(h_key);
+    BCryptCloseAlgorithmProvider(h_rsa_alg, 0);
+    free(bcrypt_blob);
     return (status == STATUS_SUCCESS);
 }
 
 static BOOL parse_and_verify_attest_structure(
-    const BYTE* attestBytes, UINT16 attestSize,
-    const BYTE* expectedNonce, UINT16 expectedNonceSize,
-    const BYTE* expectedQn, UINT16 expectedQnSize,
-    BYTE* outPcrDigest, UINT16* outPcrDigestSize)
+    const BYTE* attest_bytes, UINT16 attest_size,
+    const BYTE* expected_nonce, UINT16 expected_nonce_size,
+    const BYTE* expected_qn, UINT16 expected_qn_size,
+    BYTE* out_pcr_digest, UINT16* out_pcr_digest_size)
 {
-    if (!attestBytes || attestSize < 37 || !expectedNonce || expectedNonceSize == 0) return FALSE;
-    if (outPcrDigestSize) *outPcrDigestSize = 0;
+    if (!attest_bytes || attest_size < 37 || !expected_nonce || expected_nonce_size == 0) return FALSE;
+    if (out_pcr_digest_size) *out_pcr_digest_size = 0;
 
     buf_parser p;
-    init_parser(&p, attestBytes, attestSize);
+    init_parser(&p, attest_bytes, attest_size);
 
-    if (read_32(&p) != 0xFF544347) return FALSE; // TPM_GENERATED_VALUE
-    if (read_16(&p) != 0x8018) return FALSE;     // TPM_ST_ATTEST_QUOTE
+    if (read_32(&p) != 0xFF544347) return FALSE;
+    if (read_16(&p) != 0x8018) return FALSE;
 
-    UINT16 qualifiedSignerSize = read_16(&p);
-    if (p.size - p.read_pos < qualifiedSignerSize) return FALSE;
-    if (expectedQn && expectedQnSize > 0) {
-        if (qualifiedSignerSize != expectedQnSize || memcmp(p.buf + p.read_pos, expectedQn, qualifiedSignerSize) != 0) {
+    UINT16 qualified_signer_size = read_16(&p);
+    if (p.size - p.read_pos < qualified_signer_size) return FALSE;
+    if (expected_qn && expected_qn_size > 0) {
+        if (qualified_signer_size != expected_qn_size || memcmp(p.buf + p.read_pos, expected_qn, qualified_signer_size) != 0) {
             printf("[!] Quote verification failed: Qualified Signer mismatch.\n");
             return FALSE;
         }
     }
-    p.read_pos += qualifiedSignerSize;
+    p.read_pos += qualified_signer_size;
 
-    UINT16 extraDataSize = read_16(&p);
-    if (p.size - p.read_pos < extraDataSize) return FALSE;
-    if (extraDataSize != expectedNonceSize || memcmp(p.buf + p.read_pos, expectedNonce, extraDataSize) != 0) {
+    UINT16 extra_data_size = read_16(&p);
+    if (p.size - p.read_pos < extra_data_size) return FALSE;
+    if (extra_data_size != expected_nonce_size || memcmp(p.buf + p.read_pos, expected_nonce, extra_data_size) != 0) {
         printf("[!] Quote verification failed: Nonce mismatch.\n");
         return FALSE;
     }
-    p.read_pos += extraDataSize;
+    p.read_pos += extra_data_size;
 
     if (p.size - p.read_pos < 25) return FALSE;
-    UINT64 tpmClock = read_64(&p);
-    read_32(&p); // resetCount
-    read_32(&p); // restartCount
+    UINT64 tpm_clock = read_64(&p);
+    read_32(&p);
+    read_32(&p);
     BYTE safe = read_8(&p);
 
-    if (tpmClock == 0 || safe != 1) {
+    if (tpm_clock == 0 || safe != 1) {
         printf("[!] Quote rejected: TPM hardware clock is non-functional (zero).\n");
         return FALSE;
     }
 
-    read_64(&p); // fwVersionObfuscated
+    read_64(&p);
 
     if (p.size - p.read_pos < 12) return FALSE;
     if (read_32(&p) != 1) return FALSE;
     if (read_16(&p) != TPM_ALG_SHA256) return FALSE;
     if (read_8(&p) != 3) return FALSE;
-    if (read_8(&p) != 0xFE) return FALSE; // PCRs 1..7 (bit 0 = 0)
-    if (read_8(&p) != 0x78) return FALSE; // PCRs 11..14
-    if (read_8(&p) != 0x01) return FALSE; // PCR 16
+    if (read_8(&p) != 0xFE) return FALSE;
+    if (read_8(&p) != 0x78) return FALSE;
+    if (read_8(&p) != 0x00) return FALSE;
 
-    UINT16 digestSize = read_16(&p);
-    if (digestSize != 32 || p.size - p.read_pos < digestSize) return FALSE;
+    UINT16 digest_size = read_16(&p);
+    if (digest_size != 32 || p.size - p.read_pos < digest_size) return FALSE;
 
-    if (outPcrDigest && outPcrDigestSize) {
-        memcpy(outPcrDigest, p.buf + p.read_pos, digestSize);
-        *outPcrDigestSize = digestSize;
+    if (out_pcr_digest && out_pcr_digest_size) {
+        memcpy(out_pcr_digest, p.buf + p.read_pos, digest_size);
+        *out_pcr_digest_size = digest_size;
     }
     return TRUE;
 }
 
-BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, PCCERT_CONTEXT ekCert, const BYTE* expectedPcrDigest, BOOL* outQuoteVerified) {
-    if (!hTbsContext || !ekCert || !expectedPcrDigest || !outQuoteVerified) return FALSE;
-    *outQuoteVerified = FALSE;
+BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT h_tbs_context, PCCERT_CONTEXT ek_cert, const BYTE* expected_pcr_digest, BOOL* out_quote_verified) {
+    if (!h_tbs_context || !ek_cert || !expected_pcr_digest || !out_quote_verified) return FALSE;
+    *out_quote_verified = FALSE;
 
     UINT32 handles[64] = { 0 };
     UINT32 handle_count = 0;
-    UINT32 preinstalled_ek_handle = 0;
+    UINT32 ek_handle = 0;
+    BOOL ek_is_transient = FALSE;
 
-    if (tpm_enumerate_persistent_handles(hTbsContext, handles, &handle_count)) {
+    if (tpm_enumerate_persistent_handles(h_tbs_context, handles, &handle_count)) {
         for (UINT32 i = 0; i < handle_count; i++) {
             if (handles[i] >= 0x81010000 && handles[i] <= 0x810100FF) {
                 BYTE* ek_pub_tpm2b = NULL;
                 DWORD ek_pub_tpm2b_size = 0;
-                if (tpm_read_public_area(hTbsContext, handles[i], &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
-                    DWORD bcrypt_blob_size = 0;
-                    BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
-                    if (bcrypt_blob) {
-                        if (ekpub_matches_cert(ekCert, bcrypt_blob, bcrypt_blob_size)) {
-                            preinstalled_ek_handle = handles[i];
+                if (tpm_read_public_area(h_tbs_context, handles[i], &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
+                    if (ek_pub_tpm2b_size >= 4 && ((ek_pub_tpm2b[2] << 8) | ek_pub_tpm2b[3]) == TPM_ALG_RSA) {
+                        DWORD bcrypt_blob_size = 0;
+                        BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
+                        if (bcrypt_blob) {
+                            if (ekpub_matches_cert(ek_cert, bcrypt_blob, bcrypt_blob_size)) {
+                                ek_handle = handles[i];
+                                ek_is_transient = FALSE;
+                                free(bcrypt_blob);
+                                free(ek_pub_tpm2b);
+                                break;
+                            }
                             free(bcrypt_blob);
-                            free(ek_pub_tpm2b);
-                            break;
                         }
-                        free(bcrypt_blob);
                     }
                     free(ek_pub_tpm2b);
                 }
@@ -1694,99 +1796,124 @@ BOOL tpm_generate_quote_and_verify(TBS_HCONTEXT hTbsContext, PCCERT_CONTEXT ekCe
         }
     }
 
-    if (preinstalled_ek_handle == 0) return FALSE;
-
-    UINT32 akHandle = 0;
-    if (!tpm_create_primary_ak(hTbsContext, &akHandle)) return FALSE;
-
-    BYTE* akPubTpm2b = NULL;
-    DWORD akPubTpm2bSize = 0;
-    if (!tpm_read_public_area(hTbsContext, akHandle, &akPubTpm2b, &akPubTpm2bSize)) {
-        tpm_flush_context(hTbsContext, akHandle);
-        return FALSE;
-    }
-
-    BYTE reportedAkName[128];
-    UINT16 reportedAkNameSize = 0;
-    BYTE reportedAkQn[128];
-    UINT16 reportedAkQnSize = 0;
-    if (!tpm_read_public(hTbsContext, akHandle, reportedAkName, &reportedAkNameSize, reportedAkQn, &reportedAkQnSize)) {
-        free(akPubTpm2b);
-        tpm_flush_context(hTbsContext, akHandle);
-        return FALSE;
-    }
-
-    BYTE computedAkName[34];
-    BYTE expectedAkQn[34];
-    if (!validate_and_compute_ak_names(akPubTpm2b, akPubTpm2bSize, reportedAkName, reportedAkNameSize, computedAkName, expectedAkQn)) {
-        free(akPubTpm2b);
-        tpm_flush_context(hTbsContext, akHandle);
-        return FALSE;
-    }
-
-    BYTE decryptedSecret[32];
-    if (!execute_possession_challenge(hTbsContext, ekCert, preinstalled_ek_handle, akHandle, computedAkName, sizeof(computedAkName), decryptedSecret)) {
-        free(akPubTpm2b);
-        tpm_flush_context(hTbsContext, akHandle);
-        return FALSE;
-    }
-
-    BYTE clientNonce[32];
-    if (BCryptGenRandom(NULL, clientNonce, sizeof(clientNonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != STATUS_SUCCESS) {
-        return FALSE;
-    }
-
-    BYTE nonceBindingInput[64];
-    memcpy(nonceBindingInput, clientNonce, 32);
-    memcpy(nonceBindingInput + 32, decryptedSecret, 32);
-    SecureZeroMemory(decryptedSecret, sizeof(decryptedSecret));
-
-    BYTE boundQuoteNonce[32];
-    calculate_sha256(nonceBindingInput, sizeof(nonceBindingInput), boundQuoteNonce);
-    SecureZeroMemory(nonceBindingInput, sizeof(nonceBindingInput));
-
-    BYTE attestBytes[1024];
-    UINT16 attestSize = 0;
-    BYTE sigBytes[512];
-    UINT16 sigSize = 0;
-
-    if (!tpm_quote(hTbsContext, akHandle, boundQuoteNonce, sizeof(boundQuoteNonce), attestBytes, &attestSize, sigBytes, &sigSize)) {
-        free(akPubTpm2b);
-        tpm_flush_context(hTbsContext, akHandle);
-        return FALSE;
-    }
-    tpm_flush_context(hTbsContext, akHandle);
-
-    if (!verify_quote_signature(attestBytes, attestSize, sigBytes, sigSize, akPubTpm2b, akPubTpm2bSize)) {
-        free(akPubTpm2b);
-        return FALSE;
-    }
-    free(akPubTpm2b);
-
-    BYTE signedPcrDigest[32];
-    UINT16 signedPcrDigestSize = 0;
-    if (!parse_and_verify_attest_structure(attestBytes, attestSize, boundQuoteNonce, sizeof(boundQuoteNonce), expectedAkQn, sizeof(expectedAkQn), signedPcrDigest, &signedPcrDigestSize)) {
-        return FALSE;
-    }
-
-    if (signedPcrDigestSize == 32) {
-        BYTE emptyPCRsZero[12 * 32] = { 0 };
-        BYTE emptyPCRsFF[12 * 32];
-        memset(emptyPCRsFF, 0xFF, sizeof(emptyPCRsFF));
-
-        BYTE unextendedZeroDigest[32] = { 0 };
-        BYTE unextendedFFDigest[32] = { 0 };
-        calculate_sha256(emptyPCRsZero, sizeof(emptyPCRsZero), unextendedZeroDigest);
-        calculate_sha256(emptyPCRsFF, sizeof(emptyPCRsFF), unextendedFFDigest);
-
-        if (memcmp(signedPcrDigest, unextendedZeroDigest, 32) == 0 ||
-            memcmp(signedPcrDigest, unextendedFFDigest, 32) == 0) {
-            printf("[!] Idle/unextended PCR bank detected in Quote.\n");
-            *outQuoteVerified = FALSE;
-            return TRUE;
+    if (ek_handle == 0) {
+        UINT32 dynamic_ek_handle = 0;
+        if (tpm_create_primary_ek(h_tbs_context, &dynamic_ek_handle)) {
+            BYTE* ek_pub_tpm2b = NULL;
+            DWORD ek_pub_tpm2b_size = 0;
+            if (tpm_read_public_area(h_tbs_context, dynamic_ek_handle, &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
+                DWORD bcrypt_blob_size = 0;
+                BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
+                if (bcrypt_blob) {
+                    if (ekpub_matches_cert(ek_cert, bcrypt_blob, bcrypt_blob_size)) {
+                        ek_handle = dynamic_ek_handle;
+                        ek_is_transient = TRUE;
+                    }
+                    free(bcrypt_blob);
+                }
+                free(ek_pub_tpm2b);
+            }
+            if (ek_handle == 0) {
+                tpm_flush_context(h_tbs_context, dynamic_ek_handle);
+            }
         }
+    }
 
-        *outQuoteVerified = (memcmp(signedPcrDigest, expectedPcrDigest, 32) == 0);
+    if (ek_handle == 0) return FALSE;
+
+    UINT32 ak_handle = 0;
+    if (!tpm_create_primary_ak(h_tbs_context, &ak_handle)) {
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+
+    BYTE* ak_pub_tpm2b = NULL;
+    DWORD ak_pub_tpm2b_size = 0;
+    if (!tpm_read_public_area(h_tbs_context, ak_handle, &ak_pub_tpm2b, &ak_pub_tpm2b_size)) {
+        tpm_flush_context(h_tbs_context, ak_handle);
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+
+    BYTE reported_ak_name[128];
+    UINT16 reported_ak_name_size = 0;
+    BYTE reported_ak_qn[128];
+    UINT16 reported_ak_qn_size = 0;
+    if (!tpm_read_public(h_tbs_context, ak_handle, reported_ak_name, &reported_ak_name_size, reported_ak_qn, &reported_ak_qn_size)) {
+        free(ak_pub_tpm2b);
+        tpm_flush_context(h_tbs_context, ak_handle);
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+
+    BYTE computed_ak_name[34];
+    BYTE expected_ak_qn[34];
+    if (!validate_and_compute_ak_names(ak_pub_tpm2b, ak_pub_tpm2b_size, reported_ak_name, reported_ak_name_size, reported_ak_qn, reported_ak_qn_size, computed_ak_name, expected_ak_qn)) {
+        free(ak_pub_tpm2b);
+        tpm_flush_context(h_tbs_context, ak_handle);
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+
+    BYTE decrypted_secret[32];
+    if (!execute_possession_challenge(h_tbs_context, ek_cert, ek_handle, ak_handle, computed_ak_name, sizeof(computed_ak_name), decrypted_secret)) {
+        free(ak_pub_tpm2b);
+        tpm_flush_context(h_tbs_context, ak_handle);
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+
+    BYTE client_nonce[32];
+    if (BCryptGenRandom(NULL, client_nonce, sizeof(client_nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != STATUS_SUCCESS) {
+        SecureZeroMemory(decrypted_secret, sizeof(decrypted_secret));
+        free(ak_pub_tpm2b);
+        tpm_flush_context(h_tbs_context, ak_handle);
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+
+    BYTE nonce_binding_input[64];
+    memcpy(nonce_binding_input, client_nonce, 32);
+    memcpy(nonce_binding_input + 32, decrypted_secret, 32);
+    SecureZeroMemory(decrypted_secret, sizeof(decrypted_secret));
+
+    BYTE bound_quote_nonce[32];
+    calculate_sha256(nonce_binding_input, sizeof(nonce_binding_input), bound_quote_nonce);
+    SecureZeroMemory(nonce_binding_input, sizeof(nonce_binding_input));
+
+    BYTE attest_bytes[1024];
+    UINT16 attest_size = 0;
+    BYTE sig_bytes[512];
+    UINT16 sig_size = 0;
+
+    if (!tpm_quote(h_tbs_context, ak_handle, bound_quote_nonce, sizeof(bound_quote_nonce), attest_bytes, &attest_size, sig_bytes, &sig_size)) {
+        free(ak_pub_tpm2b);
+        tpm_flush_context(h_tbs_context, ak_handle);
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+    tpm_flush_context(h_tbs_context, ak_handle);
+
+    if (!verify_quote_signature(attest_bytes, attest_size, sig_bytes, sig_size, ak_pub_tpm2b, ak_pub_tpm2b_size)) {
+        free(ak_pub_tpm2b);
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+    free(ak_pub_tpm2b);
+
+    BYTE signed_pcr_digest[32];
+    UINT16 signed_pcr_digest_size = 0;
+    if (!parse_and_verify_attest_structure(attest_bytes, attest_size, bound_quote_nonce, sizeof(bound_quote_nonce), expected_ak_qn, sizeof(expected_ak_qn), signed_pcr_digest, &signed_pcr_digest_size)) {
+        if (ek_is_transient) tpm_flush_context(h_tbs_context, ek_handle);
+        return FALSE;
+    }
+
+    if (signed_pcr_digest_size == 32) {
+        *out_quote_verified = (memcmp(signed_pcr_digest, expected_pcr_digest, 32) == 0);
+    }
+
+    if (ek_is_transient) {
+        tpm_flush_context(h_tbs_context, ek_handle);
     }
     return TRUE;
 }

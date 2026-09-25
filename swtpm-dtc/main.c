@@ -142,10 +142,6 @@ static BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
         if (extract_aia_ca_issuers(leaf, &urls)) {
             for (size_t i = 0; i < urls.count; ++i) {
                 if (!urls.items[i]) continue;
-                if (!is_trusted_manufacturer_url(urls.items[i])) {
-                    fprintf(out, "%*s[!] Skipping unpinned AIA domain: %ws\n", (int)(depth * 2), "", urls.items[i]);
-                    continue;
-                }
 
                 BYTE* data = NULL;
                 DWORD size = 0;
@@ -213,7 +209,7 @@ static BOOL has_ek_eku(PCCERT_CONTEXT cert) {
         if (pUsage->rgpszUsageIdentifier) {
             for (DWORD i = 0; i < pUsage->cUsageIdentifier; i++) {
                 if (pUsage->rgpszUsageIdentifier[i] &&
-                    strcmp(pUsage->rgpszUsageIdentifier[i], "2.23.133.8.1") == 0) { 
+                    strcmp(pUsage->rgpszUsageIdentifier[i], "2.23.133.8.1") == 0) {
                     found = TRUE;
                     break;
                 }
@@ -275,6 +271,7 @@ int wmain(void) {
         fprintf(stderr, "[-] CAB extraction failed.\n");
         goto cleanup;
     }
+
     if (!get_tpm_info_via_ncrypt(&info)) {
         fprintf(stderr, "[-] Could not obtain TPM information via NCrypt provider.\n");
         goto cleanup;
@@ -321,11 +318,6 @@ int wmain(void) {
     {
         PCCERT_CONTEXT c = NULL;
         while ((c = CertEnumCertificatesInStore(hEkStore, c)) != NULL) {
-            char subject[1024] = { 0 };
-            char issuer[1024] = { 0 };
-            CertGetNameStringA(c, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, subject, _countof(subject));
-            CertGetNameStringA(c, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG, NULL, issuer, _countof(issuer));
-
             if (verify_ek_by_manual_chain(c, info.ekPub, info.ekPubSize, hRoots, hCandidateStore, &ekLeaf)) {
                 ok = TRUE;
                 CertFreeCertificateContext(c);
@@ -350,48 +342,26 @@ int wmain(void) {
         goto cleanup;
     }
 
-    printf("\n[*] Running attestation...\n");
+    printf("\n[*] Running attestation checks...\n");
     if (!detect_tpm_passthrough(ekLeaf)) {
         printf("[-] Result: Virtualized, proxied, or spoofed TPM detected by attestation.\n");
         ok = FALSE;
     }
     else {
-        printf("[+] Result: TPM successfully verified, no unusual stuff detected.\n");
+        printf("[+] Result: TPM is legit.\n");
     }
 
 cleanup:
-    if (ekLeaf) {
-        CertFreeCertificateContext(ekLeaf);
-        ekLeaf = NULL;
-    }
-    if (hCandidateStore) {
-        CertCloseStore(hCandidateStore, 0);
-        hCandidateStore = NULL;
-    }
-    if (hEkStore) {
-        CertCloseStore(hEkStore, 0);
-        hEkStore = NULL;
-    }
-    if (hRoots) {
-        CertCloseStore(hRoots, 0);
-        hRoots = NULL;
-    }
-    if (hCabStore) {
-        CertCloseStore(hCabStore, 0);
-        hCabStore = NULL;
-    }
-    if (info.ekPub) {
-        free(info.ekPub);
-        info.ekPub = NULL;
-    }
+    if (ekLeaf) CertFreeCertificateContext(ekLeaf);
+    if (hCandidateStore) CertCloseStore(hCandidateStore, 0);
+    if (hEkStore) CertCloseStore(hEkStore, 0);
+    if (hRoots) CertCloseStore(hRoots, 0);
+    if (hCabStore) CertCloseStore(hCabStore, 0);
+    if (info.ekPub) free(info.ekPub);
     free_filelist(&g_extracted);
-    memset(&g_extracted, 0, sizeof(g_extracted));
-    if (cab) {
-        free(cab);
-        cab = NULL;
-    }
+    if (cab) free(cab);
 
-    printf("[*] Running version: v4.0\n");
+    printf("Version: v4.1\n");
     system("pause");
     return ok ? 0 : 1;
 }

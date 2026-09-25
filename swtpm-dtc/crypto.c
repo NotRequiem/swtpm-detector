@@ -565,49 +565,6 @@ BOOL sha256_hex(const BYTE* data, DWORD size, char outHex[65]) {
     return TRUE;
 }
 
-static const TRUSTED_URL kTrustedManufacturerUrls[] = {
-    { L"ekop.intel.com", L"/ekcertservice", FALSE, TRUE },
-    { L"ekcert.intel.com", L"/ekcertservice", FALSE, TRUE },
-    { L"ftpm.amd.com", L"/pki/aia", TRUE, TRUE },
-    { L"ekcert.spserv.microsoft.com", L"/EKCertificate/GetEKCertificate/v1", FALSE, TRUE },
-    { L"pki.infineon.com", L"/", TRUE, TRUE },
-    { L"tpm.nuvoton.com", L"/", TRUE, TRUE }
-};
-
-BOOL is_trusted_manufacturer_url(const WCHAR* url) {
-    if (!url || !url_is_http(url)) return FALSE;
-
-    const WCHAR* sep = wcsstr(url, L"://");
-    if (!sep) return FALSE;
-    const WCHAR* host = sep + 3;
-    const WCHAR* path = wcschr(host, L'/');
-    if (!path) return FALSE;
-
-    const WCHAR* host_end = host;
-    while (host_end < path && *host_end != L':') {
-        host_end++;
-    }
-    size_t host_len = (size_t)(host_end - host);
-    if (host_len == 0) return FALSE;
-
-    for (size_t i = 0; i < sizeof(kTrustedManufacturerUrls) / sizeof(kTrustedManufacturerUrls[0]); i++) {
-        size_t trusted_host_len = wcslen(kTrustedManufacturerUrls[i].host);
-        if (host_len != trusted_host_len) continue;
-        if (_wcsnicmp(host, kTrustedManufacturerUrls[i].host, host_len) != 0) continue;
-
-        size_t prefix_len = wcslen(kTrustedManufacturerUrls[i].path_prefix);
-        if (_wcsnicmp(path, kTrustedManufacturerUrls[i].path_prefix, prefix_len) == 0) {
-            if (kTrustedManufacturerUrls[i].path_prefix[prefix_len - 1] == L'/' ||
-                path[prefix_len] == L'\0' ||
-                path[prefix_len] == L'/' ||
-                path[prefix_len] == L'?') {
-                return TRUE;
-            }
-        }
-    }
-    return FALSE;
-}
-
 BOOL check_issuer_basic_constraints_and_key_usage(PCCERT_CONTEXT cert) {
     if (!cert || !cert->pCertInfo) return FALSE;
 

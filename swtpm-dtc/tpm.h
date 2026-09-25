@@ -22,6 +22,8 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <strsafe.h>
+#include <setupapi.h>
+
 
 #ifdef _MSC_VER
     #pragma comment(lib, "winhttp.lib")
@@ -115,6 +117,7 @@
 #define TPM_CC_NV_Read             0x0000014E
 #define TPM_CC_Quote               0x00000158
 #define TPM_CC_PCR_Extend          0x00000182
+#define TPM_CC_PCR_Reset           0x0000013D
 
 #define TPM_ALG_RSA                0x0001
 #ifndef TPM_ALG_SHA256
@@ -124,6 +127,43 @@
 #define TPM_ALG_RSASSA             0x0014
 #define TPM_ALG_ECC                0x0023
 #define TPM_SE_POLICY              0x01
+
+#define TCG_ET_NO_ACTION                      0x00000003U
+#define TCG_ET_SEPARATOR                      0x00000004U
+#define TCG_ET_EFI_VARIABLE_DRIVER_CONFIG     0x80000001U
+#define TCG_ET_EFI_VARIABLE_AUTHORITY         0x800000E0U
+
+#define EV_PREBOOT_CERT             0x00000000
+#define EV_POST_CODE                0x00000001
+#define EV_NO_ACTION                0x00000003
+#define EV_SEPARATOR                0x00000004
+#define EV_ACTION                   0x00000005
+#define EV_EVENT_TAG                0x00000006
+#define EV_S_CRTM_CONTENTS          0x00000007
+#define EV_S_CRTM_VERSION           0x00000008
+#define EV_CPU_MICROCODE            0x00000009
+#define EV_PLATFORM_CONFIG_FLAGS    0x0000000A
+#define EV_TABLE_OF_DEVICES         0x0000000B
+#define EV_COMPACT_HASH             0x0000000C
+#define EV_IPL                      0x0000000D
+#define EV_IPL_PARTITION_DATA       0x0000000E
+#define EV_NONHOST_CODE             0x0000000F
+#define EV_NONHOST_CONFIG           0x00000010
+#define EV_NONHOST_INFO             0x00000011
+#define EV_OMIT_BOOT_DEVICE_EVENTS  0x00000012
+
+#define EV_EFI_VARIABLE_DRIVER_CONFIG   0x800000E1
+#define EV_EFI_VARIABLE_BOOT            0x800000E2
+#define EV_EFI_BOOT_SERVICES_APPLICATION 0x80000003
+#define EV_EFI_BOOT_SERVICES_DRIVER     0x80000004
+#define EV_EFI_RUNTIME_SERVICES_DRIVER  0x80000005
+#define EV_EFI_GPT_EVENT                0x80000006
+#define EV_EFI_ACTION                   0x80000007
+#define EV_EFI_PLATFORM_FIRMWARE_BLOB   0x80000008
+#define EV_EFI_HANDOFF_TABLES           0x80000009
+#define EV_EFI_PLATFORM_FIRMWARE_BLOB2  0x8000000A
+#define EV_EFI_HANDOFF_TABLES2          0x8000000B
+#define EV_EFI_VARIABLE_AUTHORITY       0x800000E0
 
 typedef struct {
     const BYTE* data;
@@ -148,6 +188,12 @@ typedef enum {
     CAB_HANDLE_TYPE_MEMSRC = 1,
     CAB_HANDLE_TYPE_FILEBUF = 2
 } CAB_HANDLE_TYPE;
+
+typedef enum {
+    AUTHORITY_UNKNOWN = 0,
+    AUTHORITY_WINDOWS_PRODUCTION_PCA,
+    AUTHORITY_UEFI_CA
+} pcr7_authority_type;
 
 typedef struct {
     DWORD magic;

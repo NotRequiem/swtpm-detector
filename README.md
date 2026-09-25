@@ -3,28 +3,21 @@
 > **`swtpm detection`**
 - A software TPM will **never** possess a manufacturer-provisioned **private** EK whose corresponding certificate chains to a genuine certification authority.
 - Dumping a private EK is impossible without a vulnerability. Software can verify if you're in possession of the correct private EK by asking your TPM to decipher a random blob with the public EK.
-- Can't be bypassed when the detection is implemented properly.
+- Can't be bypassed.
 
 > **`passthrough detection`**
 - Checks if PCRs 1-7 mathematically reconstructed from TCG logs and actual hardware PCRs mismatch.
-- PCR0 is excluded. Firmware can place PCR0-related information into the event log without extending it.
-- The detection can be bypassed if the firmware is patched so that the TPM never measures the host's boot chain, or if the attacker (who is in control of such chain) reconstructs the VM's TCG logs accordingly.
-
-> **`flashing/resetting detection`**
-- Changing the EPS to derive a new EK makes the manufacturer-backed credential chain broken unless the issuer re-enrolls and issues a fresh EK credential for that new EK.
-- A change of EPS makes it **impossible** to recreate any EKs derived from the previous seed.
-- A trust chain can be maintained by cross certification **only between the Platform and Endorsement hierarchies** when seeds change.
-
-In summary, a probe that asks *"Is this the same TPM instance that the OEM originally certified?"* will always fail after HWID spoofing on your TPM.
+- PCR 0 is excluded. Firmware can place PCR0-related information into the event log without extending it.
+- The detection can be bypassed if the firmware is patched so that the TPM never measures the host's boot chain.
 
 > **`hypervisor proxying`**
 - A hypervisor that is proxying commands to a physical TPM can be detected by asking the TPM to sign a quote, because a hardware TPM will only sign a quote containing its own internal host PCR values.
 - Because the signature is calculated over the raw attestation data block (which contains the PCR selection and the PCR digest), any host-side modification of the PCR selection mask or the signed digest would cause the signature verification to fail when evaluated with the AK public key.
 
-> **`attaching a secondary TPM`**
+> **`using a secondary TPM`**
 - An attacker could attach a discrete physical TPM like a cheap usb-based TPM, and the hypervisor could proxy the guest's TPM commands to this idle secondary TPM.
 - The Quote check succeeds because the idle physical TPM signs its empty PCRs, which match the guest's simulated empty TCG log. 
-- However, because the secondary TPM is not the primary boot TPM of the host, it does not measure the host's boot process. Its PCRs 1–7 remain in their unextended initialization state. Therefore, the bypass is detected by ensuring that the PCRs selected for the quote are not default-initialized.
+- The bypass is detected by ensuring that the PCRs selected for the quote are not default-initialized.
 
 ---
 
