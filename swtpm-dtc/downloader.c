@@ -75,11 +75,16 @@ BOOL download_url_to_memory(const wchar_t* url, BYTE** outData, DWORD* outSize) 
         uc.dwExtraInfoLength = (DWORD)(fragment - extra);
     }
 
-    if (uc.nScheme != INTERNET_SCHEME_HTTPS) {
-        fprintf(stderr, "[!] Insecure transport: HTTPS is required.\n");
+    if (uc.nScheme == INTERNET_SCHEME_HTTPS) {
+        dwFlags |= WINHTTP_FLAG_SECURE;
+    }
+    else if (uc.nScheme == INTERNET_SCHEME_HTTP) {
+        dwFlags = 0;
+    }
+    else {
+        fprintf(stderr, "[!] Unsupported protocol scheme. Only HTTP and HTTPS are supported.\n");
         goto cleanup;
     }
-    dwFlags |= WINHTTP_FLAG_SECURE;
 
     if (uc.dwUrlPathLength == 0 || path[0] == L'\0') {
         if (FAILED(StringCchCopyW(fullPath, _countof(fullPath), L"/"))) goto cleanup;
