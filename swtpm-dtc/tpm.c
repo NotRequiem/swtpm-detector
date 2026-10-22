@@ -280,20 +280,11 @@ static BOOL parse_tpm2b_public_ecc(const BYTE* tpm2b, DWORD tpm2b_size, UINT16* 
     if (!x) return FALSE;
     read_buf(&p, x, x_size);
 
-    if (p.read_pos + 2 > max_end) {
-        free(x);
-        return FALSE;
-    }
+    if (p.read_pos + 2 > max_end) { free(x); return FALSE; }
     UINT16 y_size = read_16(&p);
-    if (y_size == 0 || p.read_pos + y_size > max_end) {
-        free(x);
-        return FALSE;
-    }
+    if (y_size == 0 || p.read_pos + y_size > max_end) { free(x); return FALSE; }
     BYTE* y = (BYTE*)malloc(y_size);
-    if (!y) {
-        free(x);
-        return FALSE;
-    }
+    if (!y) { free(x); return FALSE; }
     read_buf(&p, y, y_size);
 
     *out_curve_id = curve_id;
@@ -468,17 +459,38 @@ static BOOL tpm_nv_read(TBS_HCONTEXT h_tbs_context, UINT32 auth_handle, UINT32 n
     return (*out_size > 0);
 }
 
-static BYTE* tpm_read_full_nv_index(TBS_HCONTEXT h_tbs_context, UINT32 auth_handle, UINT32 nv_index, DWORD* out_total_size) {
+static BYTE* tpm_read_full_nv_index(TBS_HCONTEXT h_tbs_context, UINT32 nv_index, DWORD* out_total_size) {
     if (!h_tbs_context || !out_total_size) return NULL;
     *out_total_size = 0;
 
     UINT16 data_size = 0;
-    if (!tpm_nv_read_public(h_tbs_context, nv_index, &data_size) || data_size == 0 || data_size > 8192) {
+    if (!tpm_nv_read_public(h_tbs_context, nv_index, &data_size) || data_size == 0 || data_size > 16384) {
         return NULL;
     }
 
     BYTE* cert_buf = (BYTE*)malloc(data_size);
     if (!cert_buf) return NULL;
+
+    const UINT32 auth_candidates[] = { TPM_RH_OWNER, TPM_RH_ENDORSEMENT, nv_index, TPM_RH_PLATFORM };
+    UINT32 active_auth = 0;
+    BOOL auth_found = FALSE;
+
+    UINT16 test_len = 0;
+    BYTE test_chunk[32];
+    UINT16 test_read = (data_size < 32) ? data_size : 32;
+
+    for (int a = 0; a < 4; a++) {
+        if (tpm_nv_read(h_tbs_context, auth_candidates[a], nv_index, test_read, 0, test_chunk, &test_len) && test_len > 0) {
+            active_auth = auth_candidates[a];
+            auth_found = TRUE;
+            break;
+        }
+    }
+
+    if (!auth_found) {
+        free(cert_buf);
+        return NULL;
+    }
 
     UINT16 bytes_read = 0;
     UINT16 chunk_size = 256;
@@ -489,18 +501,8 @@ static BYTE* tpm_read_full_nv_index(TBS_HCONTEXT h_tbs_context, UINT32 auth_hand
 
         BYTE chunk[256];
         UINT16 read_len = 0;
-        if (!tpm_nv_read(h_tbs_context, auth_handle, nv_index, to_read, bytes_read, chunk, &read_len)) {
-            if (auth_handle == TPM_RH_OWNER) {
-                if (tpm_nv_read(h_tbs_context, TPM_RH_ENDORSEMENT, nv_index, to_read, bytes_read, chunk, &read_len)) {
-                    goto chunk_ok;
-                }
-            }
-            free(cert_buf);
-            return NULL;
-        }
-
-    chunk_ok:
-        if (read_len == 0 || read_len > to_read) {
+        if (!tpm_nv_read(h_tbs_context, active_auth, nv_index, to_read, bytes_read, chunk, &read_len) ||
+            read_len == 0 || read_len > to_read) {
             free(cert_buf);
             return NULL;
         }
@@ -510,6 +512,103 @@ static BYTE* tpm_read_full_nv_index(TBS_HCONTEXT h_tbs_context, UINT32 auth_hand
 
     *out_total_size = data_size;
     return cert_buf;
+}
+
+void add_all_certs_from_buffer(HCERTSTORE h_store, const BYTE* data, DWORD size) {
+    if (!h_store || !data || size == 0) return;
+
+    CRYPT_DATA_BLOB blob = { size, (BYTE*)data };
+    DWORD dwEncoding = 0, dwContentType = 0, dwFormatType = 0;
+    HCERTSTORE hMsgStore = NULL;
+    const void* pvContext = NULL;
+
+    if (CryptQueryObject(
+        CERT_QUERY_OBJECT_BLOB,
+        &blob,
+        CERT_QUERY_CONTENT_FLAG_CERT | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED |
+        CERT_QUERY_CONTENT_FLAG_PKCS7_UNSIGNED | CERT_QUERY_CONTENT_FLAG_SERIALIZED_STORE,
+        CERT_QUERY_FORMAT_FLAG_ALL,
+        0,
+        &dwEncoding,
+        &dwContentType,
+        &dwFormatType,
+        &hMsgStore,
+        NULL,
+        &pvContext))
+    {
+        if (pvContext && dwContentType == CERT_QUERY_CONTENT_CERT) {
+            CertAddCertificateContextToStore(h_store, (PCCERT_CONTEXT)pvContext, CERT_STORE_ADD_USE_EXISTING, NULL);
+            CertFreeCertificateContext((PCCERT_CONTEXT)pvContext);
+        }
+        if (hMsgStore) {
+            PCCERT_CONTEXT pEnum = NULL;
+            while ((pEnum = CertEnumCertificatesInStore(hMsgStore, pEnum)) != NULL) {
+                CertAddCertificateContextToStore(h_store, pEnum, CERT_STORE_ADD_USE_EXISTING, NULL);
+            }
+            CertCloseStore(hMsgStore, 0);
+        }
+    }
+
+    // concatenated DER X.509 certificates
+    DWORD offset = 0;
+    while (offset + 4 < size) {
+        if (data[offset] != 0x30) {
+            offset++;
+            continue;
+        }
+
+        PCCERT_CONTEXT ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, data + offset, size - offset);
+        if (ctx) {
+            CertAddCertificateContextToStore(h_store, ctx, CERT_STORE_ADD_USE_EXISTING, NULL);
+            DWORD encoded_len = ctx->cbCertEncoded;
+            CertFreeCertificateContext(ctx);
+            if (encoded_len == 0) break;
+            offset += encoded_len;
+        }
+        else {
+            offset++;
+        }
+    }
+}
+
+static BOOL tpm_enumerate_nv_handles(TBS_HCONTEXT h_tbs_context, UINT32 start_handle, UINT32* out_handles, UINT32* out_count) {
+    if (!h_tbs_context || !out_handles || !out_count) return FALSE;
+    *out_count = 0;
+
+    BYTE cmd[128];
+    buf_builder b;
+    init_builder(&b, cmd, sizeof(cmd));
+
+    write_16(&b, TPM_ST_NO_SESSIONS);
+    write_32(&b, 0);
+    write_32(&b, TPM_CC_GetCapability);
+    write_32(&b, 0x00000001); // TPM_CAP_HANDLES
+    write_32(&b, start_handle);
+    write_32(&b, 64);
+    patch_32(cmd, 2, b.write_pos);
+
+    BYTE resp[4096];
+    UINT32 resp_size = sizeof(resp);
+    if (!send_tpm_command(h_tbs_context, cmd, b.write_pos, resp, &resp_size)) return FALSE;
+    if (resp_size < 10) return FALSE;
+
+    buf_parser p;
+    init_parser(&p, resp, resp_size);
+    read_16(&p); read_32(&p);
+    if (read_32(&p) != 0) return FALSE;
+
+    read_8(&p);
+    if (read_32(&p) != 0x00000001) return FALSE;
+
+    UINT32 count = read_32(&p);
+    if (count > 64) count = 64;
+    if (p.size - p.read_pos < count * 4) return FALSE;
+    *out_count = count;
+
+    for (UINT32 i = 0; i < count; i++) {
+        out_handles[i] = read_32(&p);
+    }
+    return TRUE;
 }
 
 BOOL get_ek_cert_store_from_nvram(HCERTSTORE* out_store) {
@@ -530,34 +629,57 @@ BOOL get_ek_cert_store_from_nvram(HCERTSTORE* out_store) {
         return FALSE;
     }
 
-    UINT32 indices[] = { 0x01c00002, 0x01c0000a };
-    BOOL found = FALSE;
+    // EK
+    const UINT32 standard_indices[] = {
+        0x01c00002, // RSA 2048 EK Cert
+        0x01c0000a, // ECC P-256 EK Cert
+        0x01c00016, // ECC P-384 EK Cert
+        0x01c00100, // Pluton / PTT EK Chain Index 0 (on-die intermediate CAs)
+        0x01c00101, // EK Chain Index 1
+        0x01c00102, // EK Chain Index 2
+        0x01c00103, // EK Chain Index 3
+        0x01c00104, // EK Chain Index 4
+        0x01c00105  // EK Chain Index 5
+    };
 
-    for (int i = 0; i < 2; i++) {
+    for (size_t i = 0; i < sizeof(standard_indices) / sizeof(standard_indices[0]); i++) {
         DWORD cert_size = 0;
-        BYTE* cert_bytes = tpm_read_full_nv_index(h_tbs_context, TPM_RH_OWNER, indices[i], &cert_size);
-        if (!cert_bytes) {
-            cert_bytes = tpm_read_full_nv_index(h_tbs_context, TPM_RH_ENDORSEMENT, indices[i], &cert_size);
-        }
-
-        if (cert_bytes) {
-            PCCERT_CONTEXT ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, cert_bytes, cert_size);
-            if (ctx) {
-                if (CertAddCertificateContextToStore(h_store, ctx, CERT_STORE_ADD_ALWAYS, NULL)) {
-                    found = TRUE;
-                }
-                CertFreeCertificateContext(ctx);
-            }
+        BYTE* cert_bytes = tpm_read_full_nv_index(h_tbs_context, standard_indices[i], &cert_size);
+        if (cert_bytes && cert_size > 0) {
+            add_all_certs_from_buffer(h_store, cert_bytes, cert_size);
             free(cert_bytes);
+        }
+    }
+
+    UINT32 dynamic_handles[64] = { 0 };
+    UINT32 dyn_count = 0;
+    if (tpm_enumerate_nv_handles(h_tbs_context, 0x01C00000, dynamic_handles, &dyn_count)) {
+        for (UINT32 i = 0; i < dyn_count; i++) {
+            if (dynamic_handles[i] >= 0x01C00000 && dynamic_handles[i] <= 0x01C001FF) {
+                BOOL already = FALSE;
+                for (size_t k = 0; k < sizeof(standard_indices) / sizeof(standard_indices[0]); k++) {
+                    if (standard_indices[k] == dynamic_handles[i]) { already = TRUE; break; }
+                }
+                if (!already) {
+                    DWORD cert_size = 0;
+                    BYTE* cert_bytes = tpm_read_full_nv_index(h_tbs_context, dynamic_handles[i], &cert_size);
+                    if (cert_bytes && cert_size > 0) {
+                        add_all_certs_from_buffer(h_store, cert_bytes, cert_size);
+                        free(cert_bytes);
+                    }
+                }
+            }
         }
     }
 
     Tbsip_Context_Close(h_tbs_context);
 
-    if (!found) {
+    PCCERT_CONTEXT first = CertEnumCertificatesInStore(h_store, NULL);
+    if (!first) {
         CertCloseStore(h_store, 0);
         return FALSE;
     }
+    CertFreeCertificateContext(first);
 
     *out_store = h_store;
     return TRUE;
@@ -1052,9 +1174,7 @@ static BOOL validate_and_compute_ak_names(
     if (type != TPM_ALG_RSA || name_alg != TPM_ALG_SHA256) return FALSE;
 
     UINT32 attrs = read_32(&p);
-    if (attrs != 0x00050072) {
-        return FALSE;
-    }
+    if (attrs != 0x00050072) return FALSE;
 
     UINT16 auth_policy_size = read_16(&p);
     if (auth_policy_size != 0 || p.size - p.read_pos < auth_policy_size || p.read_pos + auth_policy_size > max_end) return FALSE;
@@ -1412,7 +1532,6 @@ BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
     if (Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &h_tbs_context) == TBS_SUCCESS) {
         UINT32 handles[64] = { 0 };
         UINT32 handle_count = 0;
-        UINT32 ek_handle = 0;
         if (tpm_enumerate_persistent_handles(h_tbs_context, handles, &handle_count)) {
             for (UINT32 i = 0; i < handle_count; i++) {
                 if (handles[i] >= 0x81010000 && handles[i] <= 0x810100FF) {
@@ -1420,7 +1539,6 @@ BOOL get_tpm_info_via_ncrypt(TPMINFO* info) {
                     DWORD ek_pub_tpm2b_size = 0;
                     if (tpm_read_public_area(h_tbs_context, handles[i], &ek_pub_tpm2b, &ek_pub_tpm2b_size)) {
                         if (ek_pub_tpm2b_size >= 4 && ((ek_pub_tpm2b[2] << 8) | ek_pub_tpm2b[3]) == TPM_ALG_RSA) {
-                            ek_handle = handles[i];
                             DWORD bcrypt_blob_size = 0;
                             BYTE* bcrypt_blob = tpm_public_to_bcrypt_blob(ek_pub_tpm2b, ek_pub_tpm2b_size, &bcrypt_blob_size);
                             if (bcrypt_blob) {
@@ -1532,11 +1650,7 @@ static void load_certs_from_registry_recursive(HKEY h_key, HCERTSTORE store, WCH
                     cb_value_name = 16384;
                     l_result = RegEnumValueW(h_key, dw_index, sz_value_name, &cb_value_name, NULL, &dw_type, lp_data, &cb_data);
                     if (l_result == ERROR_SUCCESS) {
-                        PCCERT_CONTEXT ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, lp_data, cb_data);
-                        if (ctx) {
-                            CertAddCertificateContextToStore(store, ctx, CERT_STORE_ADD_NEW, NULL);
-                            CertFreeCertificateContext(ctx);
-                        }
+                        add_all_certs_from_buffer(store, lp_data, cb_data);
                     }
                     free(lp_data);
                     lp_data = NULL;
@@ -1576,7 +1690,19 @@ static void load_tpm_intermediate_certs_from_registry(HCERTSTORE store) {
     free(sz_value_name);
 }
 
-BOOL build_candidate_issuer_store(HCERTSTORE h_cab_store, HCERTSTORE* out_store) {
+static void import_system_store_to_candidate_store(LPCWSTR store_name, HCERTSTORE h_target) {
+    HCERTSTORE h_sys = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, (HCRYPTPROV_LEGACY)NULL,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG, store_name);
+    if (h_sys) {
+        PCCERT_CONTEXT c = NULL;
+        while ((c = CertEnumCertificatesInStore(h_sys, c)) != NULL) {
+            CertAddCertificateContextToStore(h_target, c, CERT_STORE_ADD_USE_EXISTING, NULL);
+        }
+        CertCloseStore(h_sys, 0);
+    }
+}
+
+BOOL build_candidate_issuer_store(HCERTSTORE h_cab_store, HCERTSTORE h_ek_store, HCERTSTORE* out_store) {
     if (!out_store) return FALSE;
     *out_store = NULL;
 
@@ -1590,8 +1716,18 @@ BOOL build_candidate_issuer_store(HCERTSTORE h_cab_store, HCERTSTORE* out_store)
         }
     }
 
+    if (h_ek_store) {
+        PCCERT_CONTEXT c = NULL;
+        while ((c = CertEnumCertificatesInStore(h_ek_store, c)) != NULL) {
+            CertAddCertificateContextToStore(h_store, c, CERT_STORE_ADD_USE_EXISTING, NULL);
+        }
+    }
+
     load_tpm_intermediate_certs_from_registry(h_store);
     load_pcp_intermediate_certs(h_store);
+
+    import_system_store_to_candidate_store(L"CA", h_store);
+    import_system_store_to_candidate_store(L"ROOT", h_store);
 
     *out_store = h_store;
     return TRUE;
@@ -1737,7 +1873,7 @@ static BOOL parse_and_verify_attest_structure(
     BYTE safe = read_8(&p);
 
     if (tpm_clock == 0 || safe != 1) {
-        printf("[!] Quote rejected: TPM hardware clock is non-functional (zero).\n");
+        printf("[!] Quote rejected: TPM hardware clock is non-functional.\n");
         return FALSE;
     }
 

@@ -10,62 +10,34 @@ static BOOL is_cert_store_empty(HCERTSTORE hStore) {
 
 static void add_downloaded_cert_or_bundle_to_store(HCERTSTORE hStore, const BYTE* data, DWORD size) {
     if (!hStore || !data || size == 0) return;
-
-    PCCERT_CONTEXT direct = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, data, size);
-    if (direct) {
-        CertAddCertificateContextToStore(hStore, direct, CERT_STORE_ADD_USE_EXISTING, NULL);
-        CertFreeCertificateContext(direct);
-        return;
-    }
-
-    CRYPT_DATA_BLOB blob = { 0 };
-    blob.pbData = (BYTE*)data;
-    blob.cbData = size;
-
-    DWORD dwMsgAndCertEncodingType = 0;
-    DWORD dwContentType = 0;
-    DWORD dwFormatType = 0;
-    HCERTSTORE hMsgStore = NULL;
-    const void* pvContext = NULL;
-
-    if (CryptQueryObject(
-        CERT_QUERY_OBJECT_BLOB,
-        &blob,
-        CERT_QUERY_CONTENT_FLAG_CERT | CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED |
-        CERT_QUERY_CONTENT_FLAG_PKCS7_UNSIGNED | CERT_QUERY_CONTENT_FLAG_SERIALIZED_STORE,
-        CERT_QUERY_FORMAT_FLAG_ALL,
-        0,
-        &dwMsgAndCertEncodingType,
-        &dwContentType,
-        &dwFormatType,
-        &hMsgStore,
-        NULL,
-        &pvContext))
-    {
-        if (pvContext && dwContentType == CERT_QUERY_CONTENT_CERT) {
-            CertAddCertificateContextToStore(hStore, (PCCERT_CONTEXT)pvContext, CERT_STORE_ADD_USE_EXISTING, NULL);
-            CertFreeCertificateContext((PCCERT_CONTEXT)pvContext);
-        }
-        if (hMsgStore) {
-            PCCERT_CONTEXT pEnum = NULL;
-            while ((pEnum = CertEnumCertificatesInStore(hMsgStore, pEnum)) != NULL) {
-                CertAddCertificateContextToStore(hStore, pEnum, CERT_STORE_ADD_USE_EXISTING, NULL);
-            }
-            CertCloseStore(hMsgStore, 0);
-        }
-    }
+    add_all_certs_from_buffer(hStore, data, size);
 }
 
 static PCCERT_CONTEXT find_cryptographic_issuer_in_store(HCERTSTORE hStore, PCCERT_CONTEXT leaf) {
     if (!hStore || !leaf || !leaf->pCertInfo) return NULL;
 
+    // resolve via AKI -> SKI
+    CRYPT_DATA_BLOB aki = { 0 };
+    if (get_cert_authority_key_identifier(leaf, &aki) && aki.pbData && aki.cbData > 0) {
+        PCCERT_CONTEXT candidate = NULL;
+        while ((candidate = CertEnumCertificatesInStore(hStore, candidate)) != NULL) {
+            CRYPT_DATA_BLOB ski = { 0 };
+            if (get_cert_subject_key_identifier(candidate, &ski) && ski.pbData && ski.cbData > 0) {
+                BOOL match = blob_equals(&aki, &ski);
+                free(ski.pbData);
+                if (match && cert_signature_validates_against_issuer(leaf, candidate)) {
+                    free(aki.pbData);
+                    return candidate;
+                }
+            }
+        }
+        free(aki.pbData);
+    }
+
+    // X.509 Subject/Issuer
     PCCERT_CONTEXT fast = find_valid_issuer_in_store(hStore, leaf);
     if (fast) {
-        if (cert_signature_validates_against_issuer(leaf, fast)) {
-            return fast;
-        }
-        CertFreeCertificateContext(fast);
-        fast = NULL;
+        return fast;
     }
 
     PCCERT_CONTEXT candidate = NULL;
@@ -78,6 +50,14 @@ static PCCERT_CONTEXT find_cryptographic_issuer_in_store(HCERTSTORE hStore, PCCE
         candidate)) != NULL)
     {
         if (cert_signature_validates_against_issuer(leaf, candidate)) {
+            return candidate;
+        }
+    }
+
+    // cryptographic signature match across candidate store
+    candidate = NULL;
+    while ((candidate = CertEnumCertificatesInStore(hStore, candidate)) != NULL) {
+        if (!cert_equals(candidate, leaf) && cert_signature_validates_against_issuer(leaf, candidate)) {
             return candidate;
         }
     }
@@ -131,7 +111,7 @@ static BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
     }
 
     if (!check_cert_revocation(leaf)) {
-        fprintf(out, "%*s[!] Certificate revocation verification failed (REVOKED or unavailable).\n", (int)(depth * 2), "");
+        fprintf(out, "%*s[!] Certificate revocation verification failed (REVOKED).\n", (int)(depth * 2), "");
         return FALSE;
     }
 
@@ -310,7 +290,7 @@ int wmain(void) {
         goto cleanup;
     }
 
-    if (!build_candidate_issuer_store(hCabStore, &hCandidateStore)) {
+    if (!build_candidate_issuer_store(hCabStore, hEkStore, &hCandidateStore)) {
         fprintf(stderr, "[-] Could not build candidate issuer store.\n");
         goto cleanup;
     }
@@ -361,7 +341,7 @@ cleanup:
     free_filelist(&g_extracted);
     if (cab) free(cab);
 
-    printf("Version: v5.0\n");
+    printf("Version: v5.1\n");
     system("pause");
     return ok ? 0 : 1;
 }

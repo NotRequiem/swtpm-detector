@@ -1,10 +1,9 @@
 #include "tpm.h"
 
 BOOL ends_with_i(const char* s, const char* suffix) {
-    size_t ls, lt;
     if (!s || !suffix) return FALSE;
-    ls = strlen(s);
-    lt = strlen(suffix);
+    size_t ls = strlen(s);
+    size_t lt = strlen(suffix);
     if (lt > ls) return FALSE;
     return _stricmp(s + (ls - lt), suffix) == 0;
 }
@@ -137,8 +136,7 @@ BOOL extract_aia_ca_issuers(PCCERT_CONTEXT cert, WSTRINGLIST* urls) {
     PCERT_EXTENSION ext = CertFindExtension(szOID_AUTHORITY_INFO_ACCESS,
         cert->pCertInfo->cExtension,
         cert->pCertInfo->rgExtension);
-    if (!ext) return TRUE;
-    if (!ext->Value.pbData || ext->Value.cbData == 0) return TRUE;
+    if (!ext || !ext->Value.pbData || ext->Value.cbData == 0) return TRUE;
 
     DWORD cb = 0;
     PCERT_AUTHORITY_INFO_ACCESS aia = NULL;
@@ -222,25 +220,7 @@ BOOL parse_certs_from_extracted_files(HCERTSTORE* outStore) {
         for (size_t i = 0; i < g_extracted.count; ++i) {
             FILEBUF* f = &g_extracted.items[i];
             if (!f || !f->data || f->size == 0) continue;
-
-            PCCERT_CONTEXT cc = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, f->data, f->size);
-            if (!cc && is_pem_data(f->data, f->size)) {
-                DWORD derSize = 0;
-                if (CryptStringToBinaryA((LPCSTR)f->data, f->size, CRYPT_STRING_BASE64HEADER, NULL, &derSize, NULL, NULL) && derSize > 0) {
-                    BYTE* derBuf = (BYTE*)malloc(derSize);
-                    if (derBuf) {
-                        if (CryptStringToBinaryA((LPCSTR)f->data, f->size, CRYPT_STRING_BASE64HEADER, derBuf, &derSize, NULL, NULL)) {
-                            cc = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, derBuf, derSize);
-                        }
-                        free(derBuf);
-                    }
-                }
-            }
-
-            if (cc) {
-                CertAddCertificateContextToStore(store, cc, CERT_STORE_ADD_ALWAYS, NULL);
-                CertFreeCertificateContext(cc);
-            }
+            add_all_certs_from_buffer(store, f->data, f->size);
         }
     }
     *outStore = store;
@@ -290,7 +270,17 @@ BOOL cert_is_self_signed(PCCERT_CONTEXT cert) {
 }
 
 BOOL cert_is_trusted_root(PCCERT_CONTEXT cert, HCERTSTORE hRoots) {
-    return (cert && hRoots && store_contains_cert_exact(hRoots, cert));
+    if (!cert) return FALSE;
+    if (hRoots && store_contains_cert_exact(hRoots, cert)) return TRUE;
+
+    HCERTSTORE hSysRoot = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, (HCRYPTPROV_LEGACY)NULL,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG, L"ROOT");
+    if (hSysRoot) {
+        BOOL in_sys = store_contains_cert_exact(hSysRoot, cert);
+        CertCloseStore(hSysRoot, 0);
+        if (in_sys) return TRUE;
+    }
+    return FALSE;
 }
 
 BOOL blob_equals(const CRYPT_DATA_BLOB* a, const CRYPT_DATA_BLOB* b) {
@@ -495,6 +485,14 @@ BOOL export_cert_public_key_blob(PCCERT_CONTEXT cert, BYTE** outBlob, DWORD* out
         *outBlobSize = 0;
         BCryptDestroyKey(hKey);
         return FALSE;
+    }
+
+    BCRYPT_KEY_HANDLE h_imported = NULL;
+    BCRYPT_ALG_HANDLE h_alg = NULL;
+    if (BCryptOpenAlgorithmProvider(&h_alg, (strcmp(cert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId, szOID_RSA_RSA) == 0) ? BCRYPT_RSA_ALGORITHM : BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0) == STATUS_SUCCESS) {
+        BCryptImportKeyPair(h_alg, NULL, blobType, &h_imported, *outBlob, *outBlobSize, 0);
+        if (h_imported) BCryptDestroyKey(h_imported);
+        BCryptCloseAlgorithmProvider(h_alg, 0);
     }
 
     BCryptDestroyKey(hKey);

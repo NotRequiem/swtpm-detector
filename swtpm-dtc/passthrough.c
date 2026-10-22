@@ -25,14 +25,13 @@ static BOOL check_secure_boot_driver_config(const uint8_t* payload, uint32_t eve
     };
 
     if (memcmp(payload, efi_global_variable_guid, 16) != 0) {
-        return TRUE; // Not an EFI_GLOBAL_VARIABLE (e.g. PK, KEK, db, dbx), valid to skip
+        return TRUE;
     }
 
     uint64_t name_len = 0, data_len = 0;
     memcpy(&name_len, payload + 16, 8);
     memcpy(&data_len, payload + 24, 8);
 
-    // "SecureBoot" has 10 characters (20 bytes). Some firmwares include the NULL terminator (11 chars)
     if (name_len != 10 && name_len != 11) return TRUE;
 
     size_t name_bytes = (size_t)name_len * sizeof(WCHAR);
@@ -68,7 +67,6 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
         0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C
     };
 
-    // Authorities in PCR 7 mus originate from image security database
     if (memcmp(payload, efi_image_security_database_guid, 16) != 0 &&
         memcmp(payload, efi_global_variable_guid, 16) != 0) {
         return AUTHORITY_UNKNOWN;
@@ -78,7 +76,6 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
     memcpy(&name_len, payload + 16, 8);
     memcpy(&data_len, payload + 24, 8);
 
-    // Variable name is "db" (2 chars) or "dbx" (3 chars), with optional null terminator
     if (name_len < 2 || name_len > 4) return AUTHORITY_UNKNOWN;
 
     size_t name_bytes = (size_t)name_len * sizeof(WCHAR);
@@ -91,7 +88,6 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
         return AUTHORITY_UNKNOWN;
     }
 
-    // VariableData must be EFI_SIGNATURE_DATA (16-byte SignatureOwner GUID + SignatureData)
     if (data_len <= 16) return AUTHORITY_UNKNOWN;
 
     size_t cert_offset = 32 + name_bytes + 16;
@@ -103,7 +99,10 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
         cert_size
     );
 
-    if (!p_cert) return AUTHORITY_UNKNOWN;
+    if (!p_cert) {
+        // May be a raw signature hash entry rather than X.509
+        return AUTHORITY_OPTION_ROM_OR_OEM;
+    }
 
     char subject[512] = { 0 };
     CertGetNameStringA(p_cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, subject, sizeof(subject));
@@ -117,17 +116,14 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
         DWORD cb_leaf_sha1 = sizeof(leaf_sha1);
 
         if (CertGetCertificateContextProperty(p_cert, CERT_SHA1_HASH_PROP_ID, leaf_sha1, &cb_leaf_sha1) && cb_leaf_sha1 == 20) {
-            // Microsoft Corporation UEFI CA 2011
             static const BYTE uefi_ca_2011_sha1[20] = {
                 0x46, 0xDE, 0xF6, 0x3B, 0x5C, 0xE6, 0x1C, 0xF8, 0xBA, 0x0D,
                 0xE2, 0xE6, 0x63, 0x9C, 0x10, 0x19, 0xD0, 0xED, 0x14, 0xF3
             };
-            // Microsoft UEFI CA 2023
             static const BYTE uefi_ca_2023_sha1[20] = {
                 0xB5, 0xEE, 0xB4, 0xA6, 0x70, 0x60, 0x48, 0x07, 0x3F, 0x0E,
                 0xD2, 0x96, 0xE7, 0xF5, 0x80, 0xA7, 0x90, 0xB5, 0x9E, 0xAA
             };
-            // Microsoft Option ROM UEFI CA 2023
             static const BYTE oprom_ca_2023_sha1[20] = {
                 0x3F, 0xB3, 0x9E, 0x2B, 0x8B, 0xD1, 0x83, 0xBF, 0x9E, 0x45,
                 0x94, 0xE7, 0x21, 0x83, 0xCA, 0x60, 0xAF, 0xCD, 0x42, 0x77
@@ -158,12 +154,10 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
                         BYTE root_sha1[20] = { 0 };
                         DWORD cb_root_sha1 = sizeof(root_sha1);
                         if (CertGetCertificateContextProperty(root_elem->pCertContext, CERT_SHA1_HASH_PROP_ID, root_sha1, &cb_root_sha1) && cb_root_sha1 == 20) {
-                            // Microsoft Corporation Third Party Marketplace Root
                             static const BYTE ms_3p_root_sha1[20] = {
                                 0xF4, 0x8D, 0x18, 0x28, 0x36, 0xAC, 0x1A, 0x60, 0x08, 0x33,
                                 0x80, 0x47, 0xEA, 0x9E, 0xEE, 0x4B, 0x9A, 0x8B, 0x74, 0x90
                             };
-                            // Microsoft Root Certificate Authority 2010
                             static const BYTE ms_root_2010_sha1[20] = {
                                 0x3B, 0x1E, 0xFD, 0x3A, 0x66, 0xEA, 0x28, 0xB1, 0x66, 0x97,
                                 0x39, 0x47, 0x03, 0xA7, 0x2C, 0xA3, 0x40, 0xA0, 0x5B, 0xD5
@@ -181,7 +175,7 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
         }
 
         CertFreeCertificateContext(p_cert);
-        return is_genuine_uefi_ca ? AUTHORITY_UEFI_CA : AUTHORITY_UNKNOWN;
+        return is_genuine_uefi_ca ? AUTHORITY_UEFI_CA : AUTHORITY_OPTION_ROM_OR_OEM;
     }
 
     if (strstr(subject, "Windows Production PCA 2011") != NULL ||
@@ -193,12 +187,10 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
         BYTE leaf_sha1[20] = { 0 };
         DWORD cb_leaf_sha1 = sizeof(leaf_sha1);
         if (CertGetCertificateContextProperty(p_cert, CERT_SHA1_HASH_PROP_ID, leaf_sha1, &cb_leaf_sha1) && cb_leaf_sha1 == 20) {
-            // Microsoft Windows Production PCA 2011
             static const BYTE win_pca_2011_sha1[20] = {
                 0x58, 0x0A, 0x6F, 0x4C, 0xC4, 0xE4, 0xB6, 0x69, 0xB9, 0xEB,
                 0xDC, 0x1B, 0x2B, 0x3E, 0x08, 0x7B, 0x80, 0xD0, 0x67, 0x8D
             };
-            // Windows UEFI CA 2023
             static const BYTE win_uefi_ca_2023_sha1[20] = {
                 0x45, 0xA0, 0xFA, 0x32, 0x60, 0x47, 0x73, 0xC8, 0x24, 0x33,
                 0xC3, 0xB7, 0xD5, 0x9E, 0x74, 0x66, 0xB3, 0xAC, 0x0C, 0x67
@@ -228,12 +220,10 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
                         BYTE root_sha1[20] = { 0 };
                         DWORD cb_root_sha1 = sizeof(root_sha1);
                         if (CertGetCertificateContextProperty(root_elem->pCertContext, CERT_SHA1_HASH_PROP_ID, root_sha1, &cb_root_sha1) && cb_root_sha1 == 20) {
-                            // Microsoft Root Certificate Authority 2010
                             static const BYTE ms_root_2010_sha1[20] = {
                                 0x3B, 0x1E, 0xFD, 0x3A, 0x66, 0xEA, 0x28, 0xB1, 0x66, 0x97,
                                 0x39, 0x47, 0x03, 0xA7, 0x2C, 0xA3, 0x40, 0xA0, 0x5B, 0xD5
                             };
-                            // Microsoft Root Authority (1997)
                             static const BYTE ms_root_auth_sha1[20] = {
                                 0xA4, 0x34, 0x89, 0x15, 0x9A, 0x52, 0x0F, 0x0D, 0x93, 0xD0,
                                 0x32, 0xCC, 0xAF, 0x37, 0xE7, 0xFE, 0x20, 0xA8, 0xB4, 0x19
@@ -251,11 +241,11 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
         }
 
         CertFreeCertificateContext(p_cert);
-        return is_genuine_ms_pca ? AUTHORITY_WINDOWS_PRODUCTION_PCA : AUTHORITY_UNKNOWN;
+        return is_genuine_ms_pca ? AUTHORITY_WINDOWS_PRODUCTION_PCA : AUTHORITY_OPTION_ROM_OR_OEM;
     }
 
     CertFreeCertificateContext(p_cert);
-    return AUTHORITY_UNKNOWN;
+    return AUTHORITY_OPTION_ROM_OR_OEM;
 }
 
 BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
@@ -264,7 +254,7 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
     uint32_t pcr7_total_authority_count = 0;
     uint32_t pcr7_windows_pca_count = 0;
     uint32_t pcr7_uefi_ca_count = 0;
-    uint32_t pcr7_unknown_authority_count = 0;
+    uint32_t pcr7_oem_or_oprom_count = 0;
     pcr7_authority_type pcr7_last_authority = AUTHORITY_UNKNOWN;
 
     BOOL pcr7_separator_seen = FALSE;
@@ -410,16 +400,55 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
 
         if (pcr_index >= 24) continue;
 
-        // Every event in active bank measurements must provide a valid SHA-256 digest
         if (!has_sha256_digest) {
             log_format_valid = FALSE;
             break;
         }
 
         if (pcr_index == 7) {
-            uint8_t computed_payload_digest[32];
-            if (!calculate_sha256(payload, event_size, computed_payload_digest) ||
-                memcmp(computed_payload_digest, current_sha256_digest, 32) != 0) {
+            BOOL digest_matches = FALSE;
+
+            if (match_et(event_type, TCG_ET_EFI_VARIABLE_DRIVER_CONFIG) || match_et(event_type, TCG_ET_SEPARATOR)) {
+                uint8_t computed_payload_digest[32];
+                if (calculate_sha256(payload, event_size, computed_payload_digest)) {
+                    if (memcmp(computed_payload_digest, current_sha256_digest, 32) == 0) {
+                        digest_matches = TRUE;
+                    }
+                }
+            }
+            else if (match_et(event_type, TCG_ET_EFI_VARIABLE_AUTHORITY)) {
+                // TCG PFP specifies hash of VariableData (UEFI_SIGNATURE_DATA)
+                if (event_size >= 32) {
+                    uint64_t name_len = 0, data_len = 0;
+                    memcpy(&name_len, payload + 16, 8);
+                    memcpy(&data_len, payload + 24, 8);
+                    size_t name_bytes = (size_t)name_len * sizeof(WCHAR);
+
+                    if (32 + name_bytes + data_len == event_size) {
+                        const uint8_t* var_data = payload + 32 + name_bytes;
+                        uint8_t computed_auth_digest[32];
+                        if (calculate_sha256(var_data, (uint32_t)data_len, computed_auth_digest)) {
+                            if (memcmp(computed_auth_digest, current_sha256_digest, 32) == 0) {
+                                digest_matches = TRUE;
+                            }
+                        }
+                    }
+                }
+                if (!digest_matches) {
+                    // Fallback in case of whole-payload hash
+                    uint8_t computed_fallback[32];
+                    if (calculate_sha256(payload, event_size, computed_fallback)) {
+                        if (memcmp(computed_fallback, current_sha256_digest, 32) == 0) {
+                            digest_matches = TRUE;
+                        }
+                    }
+                }
+            }
+            else {
+                digest_matches = TRUE;
+            }
+
+            if (!digest_matches) {
                 pcr7_invalid_sequence = TRUE;
             }
 
@@ -429,14 +458,16 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
                 if (pcr7_separator_count > 1) {
                     pcr7_invalid_sequence = TRUE;
                 }
-                if (event_size != 4 || !payload || payload[0] != 0 || payload[1] != 0 || payload[2] != 0 || payload[3] != 0) {
-                    pcr7_invalid_sequence = TRUE;
+                // TCG specifies separator event payload as 00000000h or FFFFFFFFh
+                if (event_size == 4) {
+                    uint32_t sep_val = 0;
+                    memcpy(&sep_val, payload, 4);
+                    if (sep_val != 0x00000000 && sep_val != 0xFFFFFFFF) {
+                        pcr7_invalid_sequence = TRUE;
+                    }
                 }
             }
             else if (match_et(event_type, TCG_ET_EFI_VARIABLE_DRIVER_CONFIG)) {
-                if (pcr7_separator_seen) {
-                    pcr7_invalid_sequence = TRUE;
-                }
                 BOOL is_sb = FALSE;
                 BOOL is_enabled = FALSE;
                 if (!check_secure_boot_driver_config(payload, event_size, &is_sb, &is_enabled)) {
@@ -452,10 +483,6 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
                 }
             }
             else if (match_et(event_type, TCG_ET_EFI_VARIABLE_AUTHORITY)) {
-                if (!pcr7_separator_seen) {
-                    pcr7_invalid_sequence = TRUE;
-                }
-
                 pcr7_authority_type auth = classify_pcr7_authority(payload, event_size);
                 pcr7_total_authority_count++;
                 pcr7_last_authority = auth;
@@ -470,11 +497,11 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
                     }
                 }
                 else {
-                    pcr7_unknown_authority_count++;
+                    pcr7_oem_or_oprom_count++;
+                    if (pcr7_windows_pca_count > 0) {
+                        pcr7_uefi_ca_after_windows_pca = TRUE;
+                    }
                 }
-            }
-            else {
-                pcr7_invalid_sequence = TRUE;
             }
         }
 
@@ -512,14 +539,8 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
         return FALSE;
     }
 
-    if (pcr7_unknown_authority_count > 0) {
-        printf("[-] Attestation rejected: Unrecognized or untrusted authority detected in PCR 7 (%u event(s)).\n", pcr7_unknown_authority_count);
-        Tbsip_Context_Close(h_tbs_context);
-        return FALSE;
-    }
-
-    if (pcr7_windows_pca_count != 1) {
-        printf("[-] Attestation rejected: Exactly one genuine Windows Production PCA authority must be present in PCR 7 (Observed: %u).\n", pcr7_windows_pca_count);
+    if (pcr7_windows_pca_count == 0) {
+        printf("[-] Attestation rejected: Genuine Windows Production PCA authority missing from PCR 7.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
@@ -530,14 +551,8 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
         return FALSE;
     }
 
-    if (pcr7_uefi_ca_count > 1) {
-        printf("[-] Attestation rejected: Multiple UEFI CA authorities detected in PCR 7 (indicates non-Windows loader).\n");
-        Tbsip_Context_Close(h_tbs_context);
-        return FALSE;
-    }
-
     if (pcr7_uefi_ca_after_windows_pca) {
-        printf("[-] Attestation rejected: UEFI CA authority observed after Windows Production PCA.\n");
+        printf("[-] Attestation rejected: Third-party authority observed after Windows Production PCA.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
