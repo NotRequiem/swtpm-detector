@@ -13,33 +13,84 @@ static void add_downloaded_cert_or_bundle_to_store(HCERTSTORE hStore, const BYTE
     add_all_certs_from_buffer(hStore, data, size);
 }
 
+static BOOL extract_key_id_from_aki(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out_kid) {
+    if (!cert || !cert->pCertInfo || !out_kid) return FALSE;
+    out_kid->pbData = NULL;
+    out_kid->cbData = 0;
+
+    PCERT_EXTENSION pExt = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER2,
+        cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension);
+    if (!pExt) {
+        pExt = CertFindExtension(szOID_AUTHORITY_KEY_IDENTIFIER,
+            cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension);
+    }
+    if (!pExt || !pExt->Value.pbData || pExt->Value.cbData == 0) return FALSE;
+
+    PCERT_AUTHORITY_KEY_ID2_INFO pAki = NULL;
+    DWORD cbAki = 0;
+    if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, szOID_AUTHORITY_KEY_IDENTIFIER2,
+        pExt->Value.pbData, pExt->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &pAki, &cbAki) && pAki) {
+        if (pAki->KeyId.cbData > 0 && pAki->KeyId.pbData) {
+            out_kid->pbData = (BYTE*)malloc(pAki->KeyId.cbData);
+            if (out_kid->pbData) {
+                memcpy(out_kid->pbData, pAki->KeyId.pbData, pAki->KeyId.cbData);
+                out_kid->cbData = pAki->KeyId.cbData;
+            }
+        }
+        LocalFree(pAki);
+        return (out_kid->cbData > 0);
+    }
+    return FALSE;
+}
+
+static BOOL extract_ski(PCCERT_CONTEXT cert, CRYPT_DATA_BLOB* out_ski) {
+    if (!cert || !cert->pCertInfo || !out_ski) return FALSE;
+    out_ski->pbData = NULL;
+    out_ski->cbData = 0;
+
+    PCERT_EXTENSION pExt = CertFindExtension(szOID_SUBJECT_KEY_IDENTIFIER,
+        cert->pCertInfo->cExtension, cert->pCertInfo->rgExtension);
+    if (!pExt || !pExt->Value.pbData || pExt->Value.cbData == 0) return FALSE;
+
+    PCRYPT_DATA_BLOB pSki = NULL;
+    DWORD cbSki = 0;
+    if (CryptDecodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, szOID_SUBJECT_KEY_IDENTIFIER,
+        pExt->Value.pbData, pExt->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, NULL, &pSki, &cbSki) && pSki) {
+        if (pSki->cbData > 0 && pSki->pbData) {
+            out_ski->pbData = (BYTE*)malloc(pSki->cbData);
+            if (out_ski->pbData) {
+                memcpy(out_ski->pbData, pSki->pbData, pSki->cbData);
+                out_ski->cbData = pSki->cbData;
+            }
+        }
+        LocalFree(pSki);
+        return (out_ski->cbData > 0);
+    }
+    return FALSE;
+}
+
 static PCCERT_CONTEXT find_cryptographic_issuer_in_store(HCERTSTORE hStore, PCCERT_CONTEXT leaf) {
     if (!hStore || !leaf || !leaf->pCertInfo) return NULL;
 
-    // resolve via AKI -> SKI
+    // AKI -> SKI
     CRYPT_DATA_BLOB aki = { 0 };
-    if (get_cert_authority_key_identifier(leaf, &aki) && aki.pbData && aki.cbData > 0) {
+    if (extract_key_id_from_aki(leaf, &aki)) {
         PCCERT_CONTEXT candidate = NULL;
         while ((candidate = CertEnumCertificatesInStore(hStore, candidate)) != NULL) {
             CRYPT_DATA_BLOB ski = { 0 };
-            if (get_cert_subject_key_identifier(candidate, &ski) && ski.pbData && ski.cbData > 0) {
-                BOOL match = blob_equals(&aki, &ski);
+            if (extract_ski(candidate, &ski)) {
+                BOOL match = (aki.cbData == ski.cbData && memcmp(aki.pbData, ski.pbData, aki.cbData) == 0);
                 free(ski.pbData);
                 if (match && cert_signature_validates_against_issuer(leaf, candidate)) {
                     free(aki.pbData);
-                    return candidate;
+                    return candidate; // KI match
                 }
             }
         }
         free(aki.pbData);
     }
 
-    // X.509 Subject/Issuer
-    PCCERT_CONTEXT fast = find_valid_issuer_in_store(hStore, leaf);
-    if (fast) {
-        return fast;
-    }
-
+    // X.509 Subject == Issuer match
     PCCERT_CONTEXT candidate = NULL;
     while ((candidate = CertFindCertificateInStore(
         hStore,
@@ -54,11 +105,13 @@ static PCCERT_CONTEXT find_cryptographic_issuer_in_store(HCERTSTORE hStore, PCCE
         }
     }
 
-    // cryptographic signature match across candidate store
+    // search across the candidate store
     candidate = NULL;
     while ((candidate = CertEnumCertificatesInStore(hStore, candidate)) != NULL) {
-        if (!cert_equals(candidate, leaf) && cert_signature_validates_against_issuer(leaf, candidate)) {
-            return candidate;
+        if (!cert_equals(candidate, leaf)) {
+            if (cert_signature_validates_against_issuer(leaf, candidate)) {
+                return candidate;
+            }
         }
     }
 
