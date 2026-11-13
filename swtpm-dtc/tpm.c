@@ -1757,8 +1757,8 @@ static BOOL tpm_quote(TBS_HCONTEXT h_tbs_context, UINT32 ak_handle, const BYTE* 
     write_32(&b, 1);
     write_16(&b, TPM_ALG_SHA256);
     write_8(&b, 3);
-    write_8(&b, 0xFE);
-    write_8(&b, 0x78);
+    write_8(&b, 0x80);
+    write_8(&b, 0x00);
     write_8(&b, 0x00);
 
     patch_32(cmd, 2, b.write_pos);
@@ -1846,7 +1846,7 @@ static BOOL parse_and_verify_attest_structure(
     init_parser(&p, attest_bytes, attest_size);
 
     if (read_32(&p) != 0xFF544347) return FALSE;
-    if (read_16(&p) != 0x8018) return FALSE;
+    if (read_16(&p) != 0x8018) return FALSE;     
 
     UINT16 qualified_signer_size = read_16(&p);
     if (p.size - p.read_pos < qualified_signer_size) return FALSE;
@@ -1883,8 +1883,8 @@ static BOOL parse_and_verify_attest_structure(
     if (read_32(&p) != 1) return FALSE;
     if (read_16(&p) != TPM_ALG_SHA256) return FALSE;
     if (read_8(&p) != 3) return FALSE;
-    if (read_8(&p) != 0xFE) return FALSE;
-    if (read_8(&p) != 0x78) return FALSE;
+    if (read_8(&p) != 0x80) return FALSE; 
+    if (read_8(&p) != 0x00) return FALSE;
     if (read_8(&p) != 0x00) return FALSE;
 
     UINT16 digest_size = read_16(&p);

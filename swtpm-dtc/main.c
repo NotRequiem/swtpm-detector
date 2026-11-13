@@ -137,9 +137,22 @@ static BOOL manual_ek_chain_walk(PCCERT_CONTEXT leaf,
     fprintf(out, "%*sSubject: %s\n", (int)(depth * 2), "", subject[0] ? subject : "(unknown)");
     fprintf(out, "%*sIssuer : %s\n", (int)(depth * 2), "", issuerName[0] ? issuerName : "(unknown)");
 
-    if (CertVerifyTimeValidity(NULL, leaf->pCertInfo) != 0) {
-        fprintf(out, "%*s[!] Certificate is expired or not yet valid.\n", (int)(depth * 2), "");
-        return FALSE;
+    LONG time_status = CertVerifyTimeValidity(NULL, leaf->pCertInfo);
+
+    if (depth == 0) {
+        if (time_status < 0) {
+            fprintf(out, "%*s[!] Leaf EK certificate is not yet valid.\n", (int)(depth * 2), "");
+            return FALSE;
+        }
+        if (time_status > 0) {
+            fprintf(out, "%*s[!] Warning: Leaf EK certificate has expired. Accepting hardware provenance via live POP.\n", (int)(depth * 2), "");
+        }
+    }
+    else {
+        if (time_status != 0) {
+            fprintf(out, "%*s[!] Intermediate/Root CA certificate is not within its validity window.\n", (int)(depth * 2), "");
+            return FALSE;
+        }
     }
 
     if (depth == 0 && cert_is_self_signed(leaf)) {
@@ -394,7 +407,7 @@ cleanup:
     free_filelist(&g_extracted);
     if (cab) free(cab);
 
-    printf("Version: v5.1\n");
+    printf("Version: v5.2\n");
     system("pause");
     return ok ? 0 : 1;
 }

@@ -13,16 +13,31 @@ static BOOL match_unicode_name(const uint8_t* ptr, size_t num_chars, const wchar
     return TRUE;
 }
 
-static BOOL check_secure_boot_driver_config(const uint8_t* payload, uint32_t event_size, BOOL* out_is_secure_boot, BOOL* out_is_enabled) {
+static BOOL check_pcr7_variable_event(
+    const uint8_t* payload,
+    uint32_t event_size,
+    BOOL* out_is_secure_boot,
+    BOOL* out_is_enabled,
+    BOOL* out_is_shim_mok)
+{
     if (out_is_secure_boot) *out_is_secure_boot = FALSE;
     if (out_is_enabled) *out_is_enabled = FALSE;
+    if (out_is_shim_mok) *out_is_shim_mok = FALSE;
     if (!payload || event_size < 32) return FALSE;
 
-    // EFI_GLOBAL_VARIABLE: {8BE4DF61-93CA-11D2-AA0D-00E098032B8C}
     static const uint8_t efi_global_variable_guid[16] = {
         0x61, 0xDF, 0xE4, 0x8B, 0xCA, 0x93, 0xD2, 0x11,
         0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C
     };
+    static const uint8_t shim_lock_guid[16] = {
+        0x50, 0xAC, 0x5D, 0x60, 0x84, 0x37, 0x52, 0x46,
+        0xB2, 0xA7, 0x71, 0x7E, 0x91, 0xD3, 0xDA, 0x77
+    };
+
+    if (memcmp(payload, shim_lock_guid, 16) == 0) {
+        if (out_is_shim_mok) *out_is_shim_mok = TRUE;
+        return TRUE;
+    }
 
     if (memcmp(payload, efi_global_variable_guid, 16) != 0) {
         return TRUE;
@@ -35,8 +50,7 @@ static BOOL check_secure_boot_driver_config(const uint8_t* payload, uint32_t eve
     if (name_len != 10 && name_len != 11) return TRUE;
 
     size_t name_bytes = (size_t)name_len * sizeof(WCHAR);
-    if (32 + name_bytes > event_size) return FALSE;
-    if (32 + name_bytes + data_len != event_size) return FALSE;
+    if (32 + name_bytes > event_size || 32 + name_bytes + data_len != event_size) return FALSE;
 
     if (match_unicode_name(payload + 32, (size_t)name_len, L"SecureBoot", 10)) {
         if (name_len == 11) {
@@ -53,15 +67,91 @@ static BOOL check_secure_boot_driver_config(const uint8_t* payload, uint32_t eve
     return TRUE;
 }
 
-static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint32_t event_size) {
-    if (!payload || event_size < 32) return AUTHORITY_UNKNOWN;
+static BOOL parse_pcr7_dbx(const uint8_t* payload, uint32_t event_size, BOOL* out_dbx_valid) {
+    if (out_dbx_valid) *out_dbx_valid = FALSE;
+    if (!payload || event_size < 32) return FALSE;
 
-    // EFI_IMAGE_SECURITY_DATABASE_GUID: {D719B2CB-3D3A-4596-A3BC-DAD00E67656F}
     static const uint8_t efi_image_security_database_guid[16] = {
         0xCB, 0xB2, 0x19, 0xD7, 0x3A, 0x3D, 0x96, 0x45,
         0xA3, 0xBC, 0xDA, 0xD0, 0x0E, 0x67, 0x65, 0x6F
     };
-    // EFI_GLOBAL_VARIABLE: {8BE4DF61-93CA-11D2-AA0D-00E098032B8C}
+
+    if (memcmp(payload, efi_image_security_database_guid, 16) != 0) {
+        return TRUE;
+    }
+
+    uint64_t name_len = 0, data_len = 0;
+    memcpy(&name_len, payload + 16, 8);
+    memcpy(&data_len, payload + 24, 8);
+
+    if (name_len < 3 || name_len > 4) return TRUE;
+
+    size_t name_bytes = (size_t)name_len * sizeof(WCHAR);
+    if (32 + name_bytes > event_size || 32 + name_bytes + data_len != event_size) return FALSE;
+
+    if (!match_unicode_name(payload + 32, (size_t)name_len, L"dbx", 3)) {
+        return TRUE;
+    }
+
+    if (data_len < 28) return FALSE;
+
+    const uint8_t* var_data = payload + 32 + name_bytes;
+    size_t offset = 0;
+    uint32_t valid_entries = 0;
+
+    static const uint8_t efi_cert_sha256_guid[16] = {
+        0x26, 0x16, 0xC4, 0xC1, 0x4C, 0x50, 0x92, 0x40,
+        0xAC, 0xA9, 0x41, 0xF9, 0x36, 0x93, 0x43, 0x28
+    };
+    static const uint8_t efi_cert_x509_guid[16] = {
+        0xA1, 0x59, 0xC0, 0xA5, 0xE4, 0x94, 0xA7, 0x4A,
+        0x87, 0xB5, 0xAB, 0x15, 0x5C, 0x2B, 0xF0, 0x72
+    };
+
+    while (offset + 28 <= data_len) {
+        uint32_t list_size = 0, header_size = 0, sig_size = 0;
+        memcpy(&list_size, var_data + offset + 16, 4);
+        memcpy(&header_size, var_data + offset + 20, 4);
+        memcpy(&sig_size, var_data + offset + 24, 4);
+
+        if (list_size < 28 + header_size || offset + list_size > data_len) {
+            return FALSE;
+        }
+        if (sig_size == 0) {
+            return FALSE;
+        }
+
+        const uint8_t* sig_type = var_data + offset;
+        if (memcmp(sig_type, efi_cert_sha256_guid, 16) == 0 ||
+            memcmp(sig_type, efi_cert_x509_guid, 16) == 0) {
+            uint32_t payload_bytes = list_size - (28 + header_size);
+            valid_entries += (payload_bytes / sig_size);
+        }
+
+        offset += list_size;
+    }
+
+    if (offset != data_len) return FALSE;
+
+    if (valid_entries > 0 && out_dbx_valid) {
+        *out_dbx_valid = TRUE;
+    }
+
+    return TRUE;
+}
+
+static pcr7_authority_type classify_pcr7_authority(
+    const uint8_t* payload,
+    uint32_t event_size,
+    BOOL* out_is_windows_uefi_ca_2023)
+{
+    if (out_is_windows_uefi_ca_2023) *out_is_windows_uefi_ca_2023 = FALSE;
+    if (!payload || event_size < 32) return AUTHORITY_UNKNOWN;
+
+    static const uint8_t efi_image_security_database_guid[16] = {
+        0xCB, 0xB2, 0x19, 0xD7, 0x3A, 0x3D, 0x96, 0x45,
+        0xA3, 0xBC, 0xDA, 0xD0, 0x0E, 0x67, 0x65, 0x6F
+    };
     static const uint8_t efi_global_variable_guid[16] = {
         0x61, 0xDF, 0xE4, 0x8B, 0xCA, 0x93, 0xD2, 0x11,
         0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C
@@ -79,8 +169,7 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
     if (name_len < 2 || name_len > 4) return AUTHORITY_UNKNOWN;
 
     size_t name_bytes = (size_t)name_len * sizeof(WCHAR);
-    if (32 + name_bytes > event_size) return AUTHORITY_UNKNOWN;
-    if (32 + name_bytes + data_len != event_size) return AUTHORITY_UNKNOWN;
+    if (32 + name_bytes > event_size || 32 + name_bytes + data_len != event_size) return AUTHORITY_UNKNOWN;
 
     const uint8_t* name_ptr = payload + 32;
     if (!match_unicode_name(name_ptr, (size_t)name_len, L"db", 2) &&
@@ -100,169 +189,114 @@ static pcr7_authority_type classify_pcr7_authority(const uint8_t* payload, uint3
     );
 
     if (!p_cert) {
-        // May be a raw signature hash entry rather than X.509
         return AUTHORITY_OPTION_ROM_OR_OEM;
     }
 
-    char subject[512] = { 0 };
-    CertGetNameStringA(p_cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, subject, sizeof(subject));
+    BYTE leaf_sha1[20] = { 0 };
+    DWORD cb_leaf_sha1 = sizeof(leaf_sha1);
 
-    if (strstr(subject, "Microsoft Corporation UEFI CA") != NULL ||
-        strstr(subject, "Microsoft UEFI CA") != NULL ||
-        strstr(subject, "Microsoft Option ROM UEFI CA") != NULL) {
+    if (CertGetCertificateContextProperty(p_cert, CERT_SHA1_HASH_PROP_ID, leaf_sha1, &cb_leaf_sha1) && cb_leaf_sha1 == 20) {
+        static const BYTE win_uefi_ca_2023_sha1[20] = {
+            0x45, 0xA0, 0xFA, 0x32, 0x60, 0x47, 0x73, 0xC8, 0x24, 0x33,
+            0xC3, 0xB7, 0xD5, 0x9E, 0x74, 0x66, 0xB3, 0xAC, 0x0C, 0x67
+        };
+        static const BYTE win_pca_2011_sha1[20] = {
+            0x58, 0x0A, 0x6F, 0x4C, 0xC4, 0xE4, 0xB6, 0x69, 0xB9, 0xEB,
+            0xDC, 0x1B, 0x2B, 0x3E, 0x08, 0x7B, 0x80, 0xD0, 0x67, 0x8D
+        };
+        static const BYTE uefi_ca_2011_sha1[20] = {
+            0x46, 0xDE, 0xF6, 0x3B, 0x5C, 0xE6, 0x1C, 0xF8, 0xBA, 0x0D,
+            0xE2, 0xE6, 0x63, 0x9C, 0x10, 0x19, 0xD0, 0xED, 0x14, 0xF3
+        };
+        static const BYTE uefi_ca_2023_sha1[20] = {
+            0xB5, 0xEE, 0xB4, 0xA6, 0x70, 0x60, 0x48, 0x07, 0x3F, 0x0E,
+            0xD2, 0x96, 0xE7, 0xF5, 0x80, 0xA7, 0x90, 0xB5, 0x9E, 0xAA
+        };
+        static const BYTE oprom_ca_2023_sha1[20] = {
+            0x3F, 0xB3, 0x9E, 0x2B, 0x8B, 0xD1, 0x83, 0xBF, 0x9E, 0x45,
+            0x94, 0xE7, 0x21, 0x83, 0xCA, 0x60, 0xAF, 0xCD, 0x42, 0x77
+        };
 
-        BOOL is_genuine_uefi_ca = FALSE;
-        BYTE leaf_sha1[20] = { 0 };
-        DWORD cb_leaf_sha1 = sizeof(leaf_sha1);
-
-        if (CertGetCertificateContextProperty(p_cert, CERT_SHA1_HASH_PROP_ID, leaf_sha1, &cb_leaf_sha1) && cb_leaf_sha1 == 20) {
-            static const BYTE uefi_ca_2011_sha1[20] = {
-                0x46, 0xDE, 0xF6, 0x3B, 0x5C, 0xE6, 0x1C, 0xF8, 0xBA, 0x0D,
-                0xE2, 0xE6, 0x63, 0x9C, 0x10, 0x19, 0xD0, 0xED, 0x14, 0xF3
-            };
-            static const BYTE uefi_ca_2023_sha1[20] = {
-                0xB5, 0xEE, 0xB4, 0xA6, 0x70, 0x60, 0x48, 0x07, 0x3F, 0x0E,
-                0xD2, 0x96, 0xE7, 0xF5, 0x80, 0xA7, 0x90, 0xB5, 0x9E, 0xAA
-            };
-            static const BYTE oprom_ca_2023_sha1[20] = {
-                0x3F, 0xB3, 0x9E, 0x2B, 0x8B, 0xD1, 0x83, 0xBF, 0x9E, 0x45,
-                0x94, 0xE7, 0x21, 0x83, 0xCA, 0x60, 0xAF, 0xCD, 0x42, 0x77
-            };
-
-            if (memcmp(leaf_sha1, uefi_ca_2011_sha1, 20) == 0 ||
-                memcmp(leaf_sha1, uefi_ca_2023_sha1, 20) == 0 ||
-                memcmp(leaf_sha1, oprom_ca_2023_sha1, 20) == 0) {
-                is_genuine_uefi_ca = TRUE;
-            }
+        if (memcmp(leaf_sha1, win_uefi_ca_2023_sha1, 20) == 0) {
+            if (out_is_windows_uefi_ca_2023) *out_is_windows_uefi_ca_2023 = TRUE;
+            CertFreeCertificateContext(p_cert);
+            return AUTHORITY_WINDOWS_PRODUCTION_PCA;
         }
-
-        if (!is_genuine_uefi_ca) {
-            CERT_CHAIN_PARA chain_para = { sizeof(CERT_CHAIN_PARA) };
-            PCCERT_CHAIN_CONTEXT p_chain = NULL;
-            DWORD chain_flags = CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
-
-            if (CertGetCertificateChain(NULL, p_cert, NULL, NULL, &chain_para, chain_flags, NULL, &p_chain)) {
-                if (p_chain && p_chain->cChain > 0 && p_chain->rgpChain[0]->cElement > 1) {
-                    DWORD err = p_chain->TrustStatus.dwErrorStatus;
-                    DWORD critical_errors = CERT_TRUST_IS_UNTRUSTED_ROOT |
-                        CERT_TRUST_IS_NOT_SIGNATURE_VALID |
-                        CERT_TRUST_IS_CYCLIC |
-                        CERT_TRUST_IS_NOT_TIME_VALID;
-
-                    if ((err & critical_errors) == 0) {
-                        PCERT_CHAIN_ELEMENT root_elem = p_chain->rgpChain[0]->rgpElement[p_chain->rgpChain[0]->cElement - 1];
-                        BYTE root_sha1[20] = { 0 };
-                        DWORD cb_root_sha1 = sizeof(root_sha1);
-                        if (CertGetCertificateContextProperty(root_elem->pCertContext, CERT_SHA1_HASH_PROP_ID, root_sha1, &cb_root_sha1) && cb_root_sha1 == 20) {
-                            static const BYTE ms_3p_root_sha1[20] = {
-                                0xF4, 0x8D, 0x18, 0x28, 0x36, 0xAC, 0x1A, 0x60, 0x08, 0x33,
-                                0x80, 0x47, 0xEA, 0x9E, 0xEE, 0x4B, 0x9A, 0x8B, 0x74, 0x90
-                            };
-                            static const BYTE ms_root_2010_sha1[20] = {
-                                0x3B, 0x1E, 0xFD, 0x3A, 0x66, 0xEA, 0x28, 0xB1, 0x66, 0x97,
-                                0x39, 0x47, 0x03, 0xA7, 0x2C, 0xA3, 0x40, 0xA0, 0x5B, 0xD5
-                            };
-
-                            if (memcmp(root_sha1, ms_3p_root_sha1, 20) == 0 ||
-                                memcmp(root_sha1, ms_root_2010_sha1, 20) == 0) {
-                                is_genuine_uefi_ca = TRUE;
-                            }
-                        }
-                    }
-                }
-                if (p_chain) CertFreeCertificateChain(p_chain);
-            }
+        if (memcmp(leaf_sha1, win_pca_2011_sha1, 20) == 0) {
+            CertFreeCertificateContext(p_cert);
+            return AUTHORITY_WINDOWS_PRODUCTION_PCA;
         }
-
-        CertFreeCertificateContext(p_cert);
-        return is_genuine_uefi_ca ? AUTHORITY_UEFI_CA : AUTHORITY_OPTION_ROM_OR_OEM;
+        if (memcmp(leaf_sha1, uefi_ca_2011_sha1, 20) == 0 ||
+            memcmp(leaf_sha1, uefi_ca_2023_sha1, 20) == 0 ||
+            memcmp(leaf_sha1, oprom_ca_2023_sha1, 20) == 0) {
+            CertFreeCertificateContext(p_cert);
+            return AUTHORITY_UEFI_CA;
+        }
     }
 
-    if (strstr(subject, "Windows Production PCA 2011") != NULL ||
-        strstr(subject, "Microsoft Windows Production PCA") != NULL ||
-        strstr(subject, "Windows UEFI CA") != NULL) {
+    CERT_CHAIN_PARA chain_para = { sizeof(CERT_CHAIN_PARA) };
+    PCCERT_CHAIN_CONTEXT p_chain = NULL;
+    DWORD chain_flags = CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
+    pcr7_authority_type result = AUTHORITY_OPTION_ROM_OR_OEM;
 
-        BOOL is_genuine_ms_pca = FALSE;
+    if (CertGetCertificateChain(NULL, p_cert, NULL, NULL, &chain_para, chain_flags, NULL, &p_chain)) {
+        if (p_chain && p_chain->cChain > 0 && p_chain->rgpChain[0]->cElement > 1) {
+            DWORD err = p_chain->TrustStatus.dwErrorStatus;
+            DWORD critical_errors = CERT_TRUST_IS_UNTRUSTED_ROOT |
+                CERT_TRUST_IS_NOT_SIGNATURE_VALID |
+                CERT_TRUST_IS_CYCLIC |
+                CERT_TRUST_IS_NOT_TIME_VALID;
 
-        BYTE leaf_sha1[20] = { 0 };
-        DWORD cb_leaf_sha1 = sizeof(leaf_sha1);
-        if (CertGetCertificateContextProperty(p_cert, CERT_SHA1_HASH_PROP_ID, leaf_sha1, &cb_leaf_sha1) && cb_leaf_sha1 == 20) {
-            static const BYTE win_pca_2011_sha1[20] = {
-                0x58, 0x0A, 0x6F, 0x4C, 0xC4, 0xE4, 0xB6, 0x69, 0xB9, 0xEB,
-                0xDC, 0x1B, 0x2B, 0x3E, 0x08, 0x7B, 0x80, 0xD0, 0x67, 0x8D
-            };
-            static const BYTE win_uefi_ca_2023_sha1[20] = {
-                0x45, 0xA0, 0xFA, 0x32, 0x60, 0x47, 0x73, 0xC8, 0x24, 0x33,
-                0xC3, 0xB7, 0xD5, 0x9E, 0x74, 0x66, 0xB3, 0xAC, 0x0C, 0x67
-            };
+            if ((err & critical_errors) == 0) {
+                PCERT_CHAIN_ELEMENT root_elem = p_chain->rgpChain[0]->rgpElement[p_chain->rgpChain[0]->cElement - 1];
+                BYTE root_sha1[20] = { 0 };
+                DWORD cb_root_sha1 = sizeof(root_sha1);
+                if (CertGetCertificateContextProperty(root_elem->pCertContext, CERT_SHA1_HASH_PROP_ID, root_sha1, &cb_root_sha1) && cb_root_sha1 == 20) {
+                    static const BYTE ms_root_2010_sha1[20] = {
+                        0x3B, 0x1E, 0xFD, 0x3A, 0x66, 0xEA, 0x28, 0xB1, 0x66, 0x97,
+                        0x39, 0x47, 0x03, 0xA7, 0x2C, 0xA3, 0x40, 0xA0, 0x5B, 0xD5
+                    };
+                    static const BYTE ms_root_auth_sha1[20] = {
+                        0xA4, 0x34, 0x89, 0x15, 0x9A, 0x52, 0x0F, 0x0D, 0x93, 0xD0,
+                        0x32, 0xCC, 0xAF, 0x37, 0xE7, 0xFE, 0x20, 0xA8, 0xB4, 0x19
+                    };
+                    static const BYTE ms_3p_root_sha1[20] = {
+                        0xF4, 0x8D, 0x18, 0x28, 0x36, 0xAC, 0x1A, 0x60, 0x08, 0x33,
+                        0x80, 0x47, 0xEA, 0x9E, 0xEE, 0x4B, 0x9A, 0x8B, 0x74, 0x90
+                    };
 
-            if (memcmp(leaf_sha1, win_pca_2011_sha1, 20) == 0 ||
-                memcmp(leaf_sha1, win_uefi_ca_2023_sha1, 20) == 0) {
-                is_genuine_ms_pca = TRUE;
-            }
-        }
-
-        if (!is_genuine_ms_pca) {
-            CERT_CHAIN_PARA chain_para = { sizeof(CERT_CHAIN_PARA) };
-            PCCERT_CHAIN_CONTEXT p_chain = NULL;
-            DWORD chain_flags = CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL;
-
-            if (CertGetCertificateChain(NULL, p_cert, NULL, NULL, &chain_para, chain_flags, NULL, &p_chain)) {
-                if (p_chain && p_chain->cChain > 0 && p_chain->rgpChain[0]->cElement > 1) {
-                    DWORD err = p_chain->TrustStatus.dwErrorStatus;
-                    DWORD critical_errors = CERT_TRUST_IS_UNTRUSTED_ROOT |
-                        CERT_TRUST_IS_NOT_SIGNATURE_VALID |
-                        CERT_TRUST_IS_CYCLIC |
-                        CERT_TRUST_IS_NOT_TIME_VALID;
-
-                    if ((err & critical_errors) == 0) {
-                        PCERT_CHAIN_ELEMENT root_elem = p_chain->rgpChain[0]->rgpElement[p_chain->rgpChain[0]->cElement - 1];
-                        BYTE root_sha1[20] = { 0 };
-                        DWORD cb_root_sha1 = sizeof(root_sha1);
-                        if (CertGetCertificateContextProperty(root_elem->pCertContext, CERT_SHA1_HASH_PROP_ID, root_sha1, &cb_root_sha1) && cb_root_sha1 == 20) {
-                            static const BYTE ms_root_2010_sha1[20] = {
-                                0x3B, 0x1E, 0xFD, 0x3A, 0x66, 0xEA, 0x28, 0xB1, 0x66, 0x97,
-                                0x39, 0x47, 0x03, 0xA7, 0x2C, 0xA3, 0x40, 0xA0, 0x5B, 0xD5
-                            };
-                            static const BYTE ms_root_auth_sha1[20] = {
-                                0xA4, 0x34, 0x89, 0x15, 0x9A, 0x52, 0x0F, 0x0D, 0x93, 0xD0,
-                                0x32, 0xCC, 0xAF, 0x37, 0xE7, 0xFE, 0x20, 0xA8, 0xB4, 0x19
-                            };
-
-                            if (memcmp(root_sha1, ms_root_2010_sha1, 20) == 0 ||
-                                memcmp(root_sha1, ms_root_auth_sha1, 20) == 0) {
-                                is_genuine_ms_pca = TRUE;
-                            }
-                        }
+                    if (memcmp(root_sha1, ms_root_2010_sha1, 20) == 0 ||
+                        memcmp(root_sha1, ms_root_auth_sha1, 20) == 0) {
+                        result = AUTHORITY_WINDOWS_PRODUCTION_PCA;
+                    }
+                    else if (memcmp(root_sha1, ms_3p_root_sha1, 20) == 0) {
+                        result = AUTHORITY_UEFI_CA;
                     }
                 }
-                if (p_chain) CertFreeCertificateChain(p_chain);
             }
         }
-
-        CertFreeCertificateContext(p_cert);
-        return is_genuine_ms_pca ? AUTHORITY_WINDOWS_PRODUCTION_PCA : AUTHORITY_OPTION_ROM_OR_OEM;
+        if (p_chain) CertFreeCertificateChain(p_chain);
     }
 
     CertFreeCertificateContext(p_cert);
-    return AUTHORITY_OPTION_ROM_OR_OEM;
+    return result;
 }
 
 BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
     if (!ek_cert) return FALSE;
 
-    uint32_t pcr7_total_authority_count = 0;
-    uint32_t pcr7_windows_pca_count = 0;
-    uint32_t pcr7_uefi_ca_count = 0;
-    uint32_t pcr7_oem_or_oprom_count = 0;
+    uint32_t pcr7_windows_auth_count = 0;
+    uint32_t pcr7_pre_windows_non_ms_authority_count = 0;
     pcr7_authority_type pcr7_last_authority = AUTHORITY_UNKNOWN;
+    BOOL pcr7_last_is_ca_2023 = FALSE;
 
     BOOL pcr7_separator_seen = FALSE;
     uint32_t pcr7_separator_count = 0;
     BOOL pcr7_invalid_sequence = FALSE;
-    BOOL pcr7_uefi_ca_after_windows_pca = FALSE;
+    BOOL pcr7_authority_after_windows = FALSE;
     BOOL pcr7_secure_boot_enabled = FALSE;
     BOOL pcr7_secure_boot_disabled_seen = FALSE;
+    BOOL pcr7_dbx_valid = FALSE;
 
     TBS_CONTEXT_PARAMS2 params = { 0 };
     TBS_HCONTEXT h_tbs_context = 0;
@@ -271,7 +305,7 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
     size_t offset = 0;
 
     uint8_t reconstructed_pcrs[24][32] = { 0 };
-    const uint32_t selected_pcrs[] = { 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14 };
+    const uint32_t selected_pcrs[] = { 7 };
     const uint32_t num_selected_pcrs = sizeof(selected_pcrs) / sizeof(selected_pcrs[0]);
     uint8_t concatenated_guest_pcrs[sizeof(selected_pcrs) / sizeof(selected_pcrs[0]) * 32] = { 0 };
     uint8_t expected_pcr_digest[32] = { 0 };
@@ -417,7 +451,6 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
                 }
             }
             else if (match_et(event_type, TCG_ET_EFI_VARIABLE_AUTHORITY)) {
-                // TCG PFP specifies hash of VariableData (UEFI_SIGNATURE_DATA)
                 if (event_size >= 32) {
                     uint64_t name_len = 0, data_len = 0;
                     memcpy(&name_len, payload + 16, 8);
@@ -435,7 +468,6 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
                     }
                 }
                 if (!digest_matches) {
-                    // Fallback in case of whole-payload hash
                     uint8_t computed_fallback[32];
                     if (calculate_sha256(payload, event_size, computed_fallback)) {
                         if (memcmp(computed_fallback, current_sha256_digest, 32) == 0) {
@@ -455,22 +487,16 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
             if (match_et(event_type, TCG_ET_SEPARATOR)) {
                 pcr7_separator_count++;
                 pcr7_separator_seen = TRUE;
-                if (pcr7_separator_count > 1) {
+                if (pcr7_separator_count > 2) {
                     pcr7_invalid_sequence = TRUE;
-                }
-                // TCG specifies separator event payload as 00000000h or FFFFFFFFh
-                if (event_size == 4) {
-                    uint32_t sep_val = 0;
-                    memcpy(&sep_val, payload, 4);
-                    if (sep_val != 0x00000000 && sep_val != 0xFFFFFFFF) {
-                        pcr7_invalid_sequence = TRUE;
-                    }
                 }
             }
             else if (match_et(event_type, TCG_ET_EFI_VARIABLE_DRIVER_CONFIG)) {
-                BOOL is_sb = FALSE;
-                BOOL is_enabled = FALSE;
-                if (!check_secure_boot_driver_config(payload, event_size, &is_sb, &is_enabled)) {
+                BOOL is_sb = FALSE, is_enabled = FALSE, is_shim_mok = FALSE;
+                if (!check_pcr7_variable_event(payload, event_size, &is_sb, &is_enabled, &is_shim_mok)) {
+                    pcr7_invalid_sequence = TRUE;
+                }
+                if (is_shim_mok) {
                     pcr7_invalid_sequence = TRUE;
                 }
                 if (is_sb) {
@@ -481,25 +507,29 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
                         pcr7_secure_boot_disabled_seen = TRUE;
                     }
                 }
+                BOOL dbx_status = FALSE;
+                if (!parse_pcr7_dbx(payload, event_size, &dbx_status)) {
+                    pcr7_invalid_sequence = TRUE;
+                }
+                if (dbx_status) {
+                    pcr7_dbx_valid = TRUE;
+                }
             }
             else if (match_et(event_type, TCG_ET_EFI_VARIABLE_AUTHORITY)) {
-                pcr7_authority_type auth = classify_pcr7_authority(payload, event_size);
-                pcr7_total_authority_count++;
+                BOOL is_ca_2023 = FALSE;
+                pcr7_authority_type auth = classify_pcr7_authority(payload, event_size, &is_ca_2023);
                 pcr7_last_authority = auth;
+                pcr7_last_is_ca_2023 = is_ca_2023;
 
                 if (auth == AUTHORITY_WINDOWS_PRODUCTION_PCA) {
-                    pcr7_windows_pca_count++;
-                }
-                else if (auth == AUTHORITY_UEFI_CA) {
-                    pcr7_uefi_ca_count++;
-                    if (pcr7_windows_pca_count > 0) {
-                        pcr7_uefi_ca_after_windows_pca = TRUE;
-                    }
+                    pcr7_windows_auth_count++;
                 }
                 else {
-                    pcr7_oem_or_oprom_count++;
-                    if (pcr7_windows_pca_count > 0) {
-                        pcr7_uefi_ca_after_windows_pca = TRUE;
+                    if (pcr7_windows_auth_count == 0) {
+                        pcr7_pre_windows_non_ms_authority_count++;
+                    }
+                    else {
+                        pcr7_authority_after_windows = TRUE;
                     }
                 }
             }
@@ -515,46 +545,56 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
 
     free(log_buffer);
 
-    if (!log_format_valid) {
-        printf("[!] Malformed TCG Event Log detected.\n");
-        Tbsip_Context_Close(h_tbs_context);
-        return FALSE;
-    }
-
-    if (pcr7_invalid_sequence || !pcr7_separator_seen || pcr7_separator_count != 1) {
-        printf("[-] Attestation rejected: Invalid PCR 7 event sequencing or separator missing/malformed.\n");
+    if (!log_format_valid || pcr7_invalid_sequence) {
+        printf("[-] Attestation rejected: Malformed TCG Event Log or invalid PCR 7 sequence.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
 
     if (!pcr7_secure_boot_enabled || pcr7_secure_boot_disabled_seen) {
-        printf("[-] Attestation rejected: Secure Boot was not enabled during boot.\n");
+        printf("[-] Attestation rejected: Secure Boot is disabled or modified in PCR 7.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
 
-    if (pcr7_total_authority_count == 0) {
-        printf("[-] Attestation rejected: No authority observed in PCR 7.\n");
+    if (!pcr7_dbx_valid) {
+        printf("[-] Attestation rejected: Missing or invalid DBX (revocation list) in PCR 7.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
 
-    if (pcr7_windows_pca_count == 0) {
-        printf("[-] Attestation rejected: Genuine Windows Production PCA authority missing from PCR 7.\n");
+    if (pcr7_pre_windows_non_ms_authority_count > 1) {
+        printf("[-] Attestation rejected: Multiple pre-boot authorities detected.\n");
+        Tbsip_Context_Close(h_tbs_context);
+        return FALSE;
+    }
+
+    if (pcr7_authority_after_windows) {
+        printf("[-] Attestation rejected: Unauthorized authority observed after Windows Boot Manager.\n");
+        Tbsip_Context_Close(h_tbs_context);
+        return FALSE;
+    }
+
+    if (pcr7_windows_auth_count == 0) {
+        printf("[-] Attestation rejected: Windows authority missing from PCR 7.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
 
     if (pcr7_last_authority != AUTHORITY_WINDOWS_PRODUCTION_PCA) {
-        printf("[-] Attestation rejected: Terminal authority in PCR 7 is not Windows Production PCA.\n");
+        printf("[-] Attestation rejected: Terminal authority in PCR 7 is not a genuine Windows authority.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
 
-    if (pcr7_uefi_ca_after_windows_pca) {
-        printf("[-] Attestation rejected: Third-party authority observed after Windows Production PCA.\n");
+    if (!pcr7_separator_seen || pcr7_separator_count < 1 || pcr7_separator_count > 2) {
+        printf("[-] Attestation rejected: Invalid PCR 7 separator count or separator missing.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
+    }
+
+    if (!pcr7_last_is_ca_2023) {
+        printf("[!] Warning: Terminal authority is legacy Windows Production PCA 2011. Updating to Windows UEFI CA 2023 is recommended.\n");
     }
 
     uint32_t offset_concat = 0;
@@ -567,7 +607,7 @@ BOOL detect_tpm_passthrough(PCCERT_CONTEXT ek_cert) {
 
     BOOL quote_verified = FALSE;
     if (!tpm_generate_quote_and_verify(h_tbs_context, ek_cert, expected_pcr_digest, &quote_verified) || !quote_verified) {
-        printf("[!] Signed TPM Quote does NOT match reconstructed platform measurements.\n");
+        printf("[!] Signed TPM Quote does NOT match reconstructed PCR digest.\n");
         Tbsip_Context_Close(h_tbs_context);
         return FALSE;
     }
